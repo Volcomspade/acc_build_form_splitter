@@ -17,6 +17,7 @@ def detect_toc_pages(reader):
     return [i for i, p in enumerate(reader.pages, start=1)
             if entry_rx.search(p.extract_text() or "")]
 
+
 def parse_toc(reader, pages):
     """
     Given TOC page numbers, extract entries (#…: Title  N).
@@ -30,11 +31,13 @@ def parse_toc(reader, pages):
             entries.append((m.group(1).strip(), int(m.group(2))))
     return entries
 
+
 def slugify(name):
     s = name.strip()
-    s = re.sub(r'[\/:\*\?"<>|]', '', s)
+    s = re.sub(r'[\/:*?"<>|]', '', s)
     s = re.sub(r'\s+', '_', s)
     return re.sub(r'_+', '_', s)
+
 
 def split_and_package(pdf_bytes, remove_patterns, prefix, suffix):
     """
@@ -50,7 +53,7 @@ def split_and_package(pdf_bytes, remove_patterns, prefix, suffix):
     with zipfile.ZipFile(zip_buf, "w") as zf:
         for idx, (title, start_pg) in enumerate(toc):
             start = start_pg - 1
-            end   = (toc[idx+1][1] - 2) if idx+1 < len(toc) else total - 1
+            end = (toc[idx+1][1] - 2) if idx+1 < len(toc) else total - 1
 
             clean = title
             for rx in remove_patterns:
@@ -71,6 +74,7 @@ def split_and_package(pdf_bytes, remove_patterns, prefix, suffix):
     zip_buf.seek(0)
     return zip_buf
 
+
 # --- Streamlit UI ---
 
 st.set_page_config(page_title="ACC Build TOC Splitter")
@@ -89,12 +93,30 @@ remove_input = st.text_input(
 prefix = st.text_input("Filename prefix", "")
 suffix = st.text_input("Filename suffix", "")
 
+if uploaded:
+    # Preview parsed titles and cleaned filenames in real time
+    st.subheader("Filename Preview")
+    table = []
+    for pdf in uploaded:
+        reader = PdfReader(io.BytesIO(pdf.read()))
+        pages = detect_toc_pages(reader)
+        toc = parse_toc(reader, pages)
+        patterns = [r.strip() for r in remove_input.split(",") if r.strip()]
+        for title, start_pg in toc:
+            clean = title
+            for rx in patterns:
+                clean = re.sub(rx, '', clean, flags=re.IGNORECASE)
+            name = slugify(clean)
+            table.append({"Original Title": title, "Filename": f"{prefix}{name}{suffix}.pdf"})
+    st.table(table)
+
 if st.button("Split & Download ZIP") and uploaded:
     patterns = [r.strip() for r in remove_input.split(",") if r.strip()]
     combined = io.BytesIO()
     with zipfile.ZipFile(combined, "w") as all_z:
         for pdf in uploaded:
-            zip_buf = split_and_package(pdf.read(), patterns, prefix, suffix)
+            pdf_bytes = pdf.read()
+            zip_buf = split_and_package(pdf_bytes, patterns, prefix, suffix)
             base = pdf.name.replace('.pdf','')
             for zi in zipfile.ZipFile(zip_buf).infolist():
                 all_z.writestr(f"{base}/{zi.filename}", zipfile.ZipFile(zip_buf).read(zi.filename))
@@ -105,3 +127,4 @@ if st.button("Split & Download ZIP") and uploaded:
         combined,
         file_name="acc_build_splits.zip"
     )
+
