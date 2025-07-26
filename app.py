@@ -23,12 +23,12 @@ def parse_toc(reader, pages):
     return entries
 
 def extract_form_name(page):
-    """Get the first non-empty line of the page and strip trailing dots."""
+    """Get the first non-empty line of a form page and strip trailing dots."""
     text = page.extract_text() or ""
     for line in text.splitlines():
         line = line.strip()
         if line:
-            return re.sub(r'\.{2,}$', '', line).strip()
+            return re.sub(r'\.{3,}$', '', line).strip()
     return ""
 
 def slugify(name):
@@ -49,29 +49,27 @@ def build_patterns(raw_input: str):
         pats.append(regex)
     return pats
 
-def split_and_package(pdf_bytes, remove_patterns, prefix, suffix):
+def split_and_package(pdf_bytes, patterns, prefix, suffix):
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    total = len(reader.pages)
     toc = parse_toc(reader, detect_toc_pages(reader))
-
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as zf:
-        for idx, (toc_title, page_num) in enumerate(toc):
-            start = page_num - 1
-            end = (toc[idx+1][1] - 2) if idx+1 < len(toc) else total - 1
+        for idx, (toc_title, pg) in enumerate(toc):
+            start = pg - 1
+            end = (toc[idx+1][1]-2) if idx+1 < len(toc) else len(reader.pages)-1
             header = extract_form_name(reader.pages[start])
             raw = header or toc_title
-            clean = raw
-            for rx in remove_patterns:
-                clean = re.sub(rx, '', clean, flags=re.IGNORECASE)
-            fname = slugify(clean)
+            cleaned = raw
+            for rx in patterns:
+                cleaned = re.sub(rx, '', cleaned, flags=re.IGNORECASE)
+            fname = slugify(cleaned)
             writer = PdfWriter()
             for p in range(start, end+1):
                 writer.add_page(reader.pages[p])
-            out = io.BytesIO()
-            writer.write(out)
-            out.seek(0)
-            zf.writestr(f"{prefix}{fname}{suffix}.pdf", out.read())
+            fragment = io.BytesIO()
+            writer.write(fragment)
+            fragment.seek(0)
+            zf.writestr(f"{prefix}{fname}{suffix}.pdf", fragment.read())
     buf.seek(0)
     return buf
 
@@ -81,30 +79,24 @@ st.set_page_config(page_title="ACC Build TOC Splitter")
 st.title("ACC Build TOC PDF Splitter")
 
 uploaded = st.file_uploader("Upload ACC Build PDF(s)", type="pdf", accept_multiple_files=True)
-remove_input = st.text_input("Patterns to remove (comma-separated; '*' wildcards or regex)", value="")
+remove_input = st.text_input("Remove patterns (comma-separated; '*' wildcards or regex)", "")
 prefix = st.text_input("Filename prefix", "")
 suffix = st.text_input("Filename suffix", "")
 
 patterns = build_patterns(remove_input)
 
-# Live preview with progress bar
+# Live preview with progress
 if uploaded:
     st.subheader("Filename Preview")
-    pdf_bytes_list = [f.read() for f in uploaded]
-    tocs = []
-    total = 0
-    for b in pdf_bytes_list:
-        reader = PdfReader(io.BytesIO(b))
-        toc = parse_toc(reader, detect_toc_pages(reader))
-        tocs.append((b, toc))
-        total += len(toc)
+    total = sum(len(parse_toc(PdfReader(io.BytesIO(f.read())), detect_toc_pages(PdfReader(io.BytesIO(f.read()))))) for f in uploaded)
     progress = st.progress(0)
     count = 0
     rows = []
-    for b, toc in tocs:
-        reader = PdfReader(io.BytesIO(b))
-        for title, page_num in toc:
-            header = extract_form_name(reader.pages[page_num-1])
+    for f in uploaded:
+        reader = PdfReader(io.BytesIO(f.read()))
+        toc = parse_toc(reader, detect_toc_pages(reader))
+        for title, pg in toc:
+            header = extract_form_name(reader.pages[pg-1])
             raw = header or title
             cleaned = raw
             for rx in patterns:
@@ -115,13 +107,13 @@ if uploaded:
             progress.progress(int(count/total * 100))
     st.table(rows)
 
-# Split & download ZIP
+# Split & Download
 if st.button("Split & Download ZIP") and uploaded:
-    output = io.BytesIO()
-    with zipfile.ZipFile(output, 'w') as all_z:
-        for b, toc in tocs:
-            buf = split_and_package(b, patterns, prefix, suffix)
+    out_zip = io.BytesIO()
+    with zipfile.ZipFile(out_zip, 'w') as zf:
+        for f in uploaded:
+            buf = split_and_package(f.read(), patterns, prefix, suffix)
             for info in zipfile.ZipFile(buf).infolist():
-                all_z.writestr(info.filename, zipfile.ZipFile(buf).read(info.filename))
-    output.seek(0)
-    st.download_button("Download all splits", output, file_name="acc_build_splits.zip")
+                zf.writestr(info.filename, zipfile.ZipFile(buf).read(info.filename))
+    out_zip.seek(0)
+    st.download_button("Download all splits", out_zip, file_name="acc_build_splits.zip")
