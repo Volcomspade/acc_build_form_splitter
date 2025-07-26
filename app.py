@@ -69,7 +69,8 @@ def split_and_package(pdf_bytes, remove_patterns, prefix, suffix):
             for p in range(start, end+1):
                 writer.add_page(reader.pages[p])
             out = io.BytesIO()
-            writer.write(out); out.seek(0)
+            writer.write(out)
+            out.seek(0)
             zf.writestr(f"{prefix}{fname}{suffix}.pdf", out.read())
     buf.seek(0)
     return buf
@@ -79,16 +80,8 @@ def split_and_package(pdf_bytes, remove_patterns, prefix, suffix):
 st.set_page_config(page_title="ACC Build TOC Splitter")
 st.title("ACC Build TOC PDF Splitter")
 
-uploaded = st.file_uploader(
-    "Upload ACC Build PDF(s)",
-    type="pdf",
-    accept_multiple_files=True
-)
-
-remove_input = st.text_input(
-    "Patterns to remove (comma-separated; '*' wildcards or regex)",
-    value=""
-)
+uploaded = st.file_uploader("Upload ACC Build PDF(s)", type="pdf", accept_multiple_files=True)
+remove_input = st.text_input("Patterns to remove (comma-separated; '*' wildcards or regex)", value="")
 prefix = st.text_input("Filename prefix", "")
 suffix = st.text_input("Filename suffix", "")
 
@@ -117,11 +110,7 @@ if uploaded:
             for rx in patterns:
                 cleaned = re.sub(rx, '', cleaned, flags=re.IGNORECASE)
             fname = slugify(cleaned)
-            rows.append({
-                "TOC Title": title,
-                "Page Header": raw,
-                "Filename": f"{prefix}{fname}{suffix}.pdf"
-            })
+            rows.append({"TOC Title": title, "Page Header": raw, "Filename": f"{prefix}{fname}{suffix}.pdf"})
             count += 1
             progress.progress(int(count/total * 100))
     st.table(rows)
@@ -135,8 +124,4 @@ if st.button("Split & Download ZIP") and uploaded:
             for info in zipfile.ZipFile(buf).infolist():
                 all_z.writestr(info.filename, zipfile.ZipFile(buf).read(info.filename))
     output.seek(0)
-    st.download_button(
-        "Download all splits",
-        output,
-        file_name="acc_build_splits.zip"
-    )
+    st.download_button("Download all splits", output, file_name="acc_build_splits.zip")
