@@ -23,12 +23,12 @@ def parse_toc(reader, pages):
     return entries
 
 def extract_form_name(page):
-    """Get the first non-empty line of a form page and strip trailing dots."""
+    """Get the first non-empty line of the page and strip trailing dots."""
     text = page.extract_text() or ""
     for line in text.splitlines():
         line = line.strip()
         if line:
-            return re.sub(r'\.{3,}$', '', line).strip()
+            return re.sub(r'\.{2,}$', '', line).strip()
     return ""
 
 def slugify(name):
@@ -56,7 +56,7 @@ def split_and_package(pdf_bytes, patterns, prefix, suffix):
     with zipfile.ZipFile(buf, 'w') as zf:
         for idx, (toc_title, pg) in enumerate(toc):
             start = pg - 1
-            end = (toc[idx+1][1]-2) if idx+1 < len(toc) else len(reader.pages)-1
+            end = (toc[idx+1][1] - 2) if idx+1 < len(toc) else len(reader.pages) - 1
             header = extract_form_name(reader.pages[start])
             raw = header or toc_title
             cleaned = raw
@@ -93,7 +93,8 @@ if uploaded:
     count = 0
     rows = []
     for f in uploaded:
-        reader = PdfReader(io.BytesIO(f.read()))
+        data = f.read()
+        reader = PdfReader(io.BytesIO(data))
         toc = parse_toc(reader, detect_toc_pages(reader))
         for title, pg in toc:
             header = extract_form_name(reader.pages[pg-1])
