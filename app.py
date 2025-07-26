@@ -27,9 +27,8 @@ def extract_form_name(page):
     text = page.extract_text() or ""
     for line in text.splitlines():
         line = line.strip()
-        if not line:
-            continue
-        return re.sub(r'\.{3,}$', '', line).strip()
+        if line:
+            return re.sub(r'\.{2,}$', '', line).strip()
     return ""
 
 def slugify(name):
@@ -39,15 +38,12 @@ def slugify(name):
     return re.sub(r'_+', '_', s)
 
 def build_patterns(raw_input: str):
-    """
-    Convert comma-separated input into regex patterns.
-    '*' wildcards become '.*'.
-    """
+    """Convert comma-separated input into regex patterns; '*'→'.*' wildcards."""
     pats = []
     for p in [x.strip() for x in raw_input.split(',') if x.strip()]:
         if '*' in p:
             esc = re.escape(p)
-            regex = esc.replace(r'\*', '.*')
+            regex = '^' + esc.replace(r'\*', '.*') + '$'
         else:
             regex = p
         pats.append(regex)
@@ -63,24 +59,18 @@ def split_and_package(pdf_bytes, remove_patterns, prefix, suffix):
         for idx, (toc_title, page_num) in enumerate(toc):
             start = page_num - 1
             end = (toc[idx+1][1] - 2) if idx+1 < len(toc) else total - 1
-
             header = extract_form_name(reader.pages[start])
             raw = header or toc_title
-
             clean = raw
             for rx in remove_patterns:
                 clean = re.sub(rx, '', clean, flags=re.IGNORECASE)
             fname = slugify(clean)
-
             writer = PdfWriter()
             for p in range(start, end+1):
                 writer.add_page(reader.pages[p])
             out = io.BytesIO()
-            writer.write(out)
-            out.seek(0)
-
+            writer.write(out); out.seek(0)
             zf.writestr(f"{prefix}{fname}{suffix}.pdf", out.read())
-
     buf.seek(0)
     return buf
 
@@ -102,43 +92,51 @@ remove_input = st.text_input(
 prefix = st.text_input("Filename prefix", "")
 suffix = st.text_input("Filename suffix", "")
 
-# Build regex patterns
 patterns = build_patterns(remove_input)
 
-# Live preview
+# Live preview with progress bar
 if uploaded:
     st.subheader("Filename Preview")
-    rows = []
-    for pdf in uploaded:
-        reader = PdfReader(io.BytesIO(pdf.read()))
+    pdf_bytes_list = [f.read() for f in uploaded]
+    tocs = []
+    total = 0
+    for b in pdf_bytes_list:
+        reader = PdfReader(io.BytesIO(b))
         toc = parse_toc(reader, detect_toc_pages(reader))
+        tocs.append((b, toc))
+        total += len(toc)
+    progress = st.progress(0)
+    count = 0
+    rows = []
+    for b, toc in tocs:
+        reader = PdfReader(io.BytesIO(b))
         for title, page_num in toc:
             header = extract_form_name(reader.pages[page_num-1])
             raw = header or title
-            name = raw
+            cleaned = raw
             for rx in patterns:
-                name = re.sub(rx, '', name, flags=re.IGNORECASE)
-            fname = slugify(name)
+                cleaned = re.sub(rx, '', cleaned, flags=re.IGNORECASE)
+            fname = slugify(cleaned)
             rows.append({
                 "TOC Title": title,
                 "Page Header": raw,
                 "Filename": f"{prefix}{fname}{suffix}.pdf"
             })
+            count += 1
+            progress.progress(int(count/total * 100))
     st.table(rows)
 
 # Split & download ZIP
 if st.button("Split & Download ZIP") and uploaded:
     output = io.BytesIO()
     with zipfile.ZipFile(output, 'w') as all_z:
-        for pdf in uploaded:
-            buf = split_and_package(pdf.read(), patterns, prefix, suffix)
-            base = Path(pdf.name).stem
+        for b, toc in tocs:
+            buf = split_and_package(b, patterns, prefix, suffix)
             for info in zipfile.ZipFile(buf).infolist():
-                all_z.writestr(f"{base}/{info.filename}",
-                               zipfile.ZipFile(buf).read(info.filename))
+                all_z.writestr(info.filename, zipfile.ZipFile(buf).read(info.filename))
     output.seek(0)
     st.download_button(
-        "Download acc_build_splits.zip",
+        "Download all splits",
         output,
         file_name="acc_build_splits.zip"
     )
