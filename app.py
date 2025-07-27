@@ -1,69 +1,118 @@
+import re
 import io
 import zipfile
+from pathlib import Path
+
 import streamlit as st
+import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
-import re
+
+# --- PDF splitting logic ---
 
 def detect_toc_pages(reader):
-    toc_rx = re.compile(r'^\s*#\s*\d+:', re.MULTILINE)
+    entry_rx = re.compile(r'^#\s*\d+:', re.MULTILINE)
     return [i for i, p in enumerate(reader.pages, start=1)
-            if toc_rx.search(p.extract_text() or "")]
+            if entry_rx.search(p.extract_text() or "")]
 
 def parse_toc(reader, toc_pages):
-    entry_rx = re.compile(r'#\s*\d+:\s*(.+?)\s+(\d+)', re.MULTILINE)
-    out = []
+    # Extract form names and start pages, handling dot leaders
+    pattern = re.compile(r'#\s*\d+:\s*(.*?)\s*\.{3,}\s*(\d+)', re.MULTILINE)
+    entries = []
     for pg in toc_pages:
-        text = reader.pages[pg-1].extract_text() or ""
-        for m in entry_rx.finditer(text):
-            out.append((m.group(1).strip(), int(m.group(2))))
-    return out
+        text = reader.pages[pg-1].extract_text() or ''
+        for m in pattern.finditer(text):
+            name = m.group(1).strip()
+            start = int(m.group(2))
+            entries.append((name, start))
+    return entries
 
-st.title("ACC Build TOC Splitter")
+def slugify(name):
+    s = name.strip()
+    s = re.sub(r'[\\/:*?"<>|]', '', s)
+    s = re.sub(r'\s+', '_', s)
+    return re.sub(r'_+', '_', s)
 
-uploads = st.file_uploader(
-    "Upload ACC Build PDF(s)", type="pdf", accept_multiple_files=True
-)
+def build_patterns(raw_input: str):
+    pats = []
+    for p in [x.strip() for x in raw_input.split(',') if x.strip()]:
+        if '*' in p:
+            esc = re.escape(p)
+            pats.append(esc.replace(r'\*','.*'))
+        else:
+            pats.append(p)
+    return pats
 
-if uploads:
-    # 1) Read each upload exactly once
-    st.subheader("🗂️ Loading files...")
-    load_prog = st.progress(0)
-    pdf_cache = []  # list of (filename, bytes)
-    for idx, f in enumerate(uploads):
-        data = f.read()
-        pdf_cache.append((f.name, data))
-        load_prog.progress(int((idx+1)/len(uploads)*100))
-    load_prog.empty()
+def split_forms(reader, entries):
+    # Determine page ranges for each form
+    splits = []
+    total = len(reader.pages)
+    for i, (name, start) in enumerate(entries):
+        end = entries[i+1][1] - 1 if i+1 < len(entries) else total
+        splits.append((name, start, end))
+    return splits
 
-    # 2) Now split each PDF in the cache
-    st.subheader("✂️ Splitting PDFs...")
-    split_prog = st.progress(0)
-    final_zip = io.BytesIO()
-    with zipfile.ZipFile(final_zip, "w") as bundle:
-        for idx, (fname, data) in enumerate(pdf_cache):
-            reader = PdfReader(io.BytesIO(data))
-            toc_pages = detect_toc_pages(reader)
-            toc_entries = parse_toc(reader, toc_pages)
-            total_pages = len(reader.pages)
+def create_zip(pdf_bytes, patterns, prefix, suffix):
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    toc_pages = detect_toc_pages(reader)
+    toc_entries = parse_toc(reader, toc_pages)
+    splits = split_forms(reader, toc_entries)
 
-            for i, (form_name, start_pg) in enumerate(toc_entries):
-                start_idx = start_pg - 1
-                end_idx = (toc_entries[i+1][1] - 2) if i+1 < len(toc_entries) else total_pages-1
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w') as zf:
+        for name, start, end in splits:
+            clean = name
+            for rx in patterns:
+                clean = re.sub(rx, '', clean, flags=re.IGNORECASE)
+            fname = slugify(clean)
 
-                writer = PdfWriter()
-                for p in range(start_idx, end_idx+1):
-                    writer.add_page(reader.pages[p])
+            writer = PdfWriter()
+            for p in range(start-1, end):
+                writer.add_page(reader.pages[p])
+            part = io.BytesIO()
+            writer.write(part)
+            part.seek(0)
+            zf.writestr(f"{prefix}{fname}{suffix}.pdf", part.read())
+    buf.seek(0)
+    return buf
 
-                buf = io.BytesIO()
-                writer.write(buf)
-                bundle.writestr(f"{form_name}.pdf", buf.getvalue())
+# --- Streamlit UI ---
 
-            split_prog.progress(int((idx+1)/len(pdf_cache)*100))
-    final_zip.seek(0)
+st.set_page_config(page_title='ACC Build TOC Splitter')
+st.title('ACC Build TOC Splitter')
 
-    # 3) Provide one download button
-    st.download_button(
-        "📥 Download All Form PDFs",
-        final_zip,
-        file_name="forms_by_TOC.zip"
-    )
+uploaded = st.file_uploader('Upload ACC Build PDF(s)', type='pdf', accept_multiple_files=True)
+remove_input = st.text_input('Remove patterns (* wildcards or regex)', '')
+prefix = st.text_input('Filename prefix', '')
+suffix = st.text_input('Filename suffix', '')
+patterns = build_patterns(remove_input)
+
+if uploaded:
+    # Download button at top
+    zip_out = io.BytesIO()
+    with zipfile.ZipFile(zip_out, 'w') as zf:
+        for f in uploaded:
+            buf = create_zip(f.read(), patterns, prefix, suffix)
+            for info in zipfile.ZipFile(buf).infolist():
+                zf.writestr(info.filename, zipfile.ZipFile(buf).read(info.filename))
+    zip_out.seek(0)
+    st.download_button('Download all splits', zip_out, file_name='acc_build_forms.zip')
+
+    # Live preview
+    st.subheader('Filename Preview')
+    table = []
+    for f in uploaded:
+        reader = PdfReader(io.BytesIO(f.read()))
+        entries = parse_toc(reader, detect_toc_pages(reader))
+        splits = split_forms(reader, entries)
+        for name, start, end in splits:
+            clean = name
+            for rx in patterns:
+                clean = re.sub(rx, '', clean, flags=re.IGNORECASE)
+            fname = slugify(clean)
+            table.append({
+                'Form Name': name,
+                'Pages': f"{start}-{end}",
+                'Filename': f"{prefix}{fname}{suffix}.pdf"
+            })
+    df = pd.DataFrame(table)
+    st.dataframe(df, width=900)
