@@ -126,21 +126,41 @@ prefix = st.text_input('Filename prefix', '')
 suffix = st.text_input('Filename suffix', '')
 patterns = build_patterns(remove_input)
 
+# After st.file_uploader and inputs…
 if uploaded:
-    # **Download button** at the top:
+    # Read all files into memory once (avoid EmptyFileError on second read)
+    uploads = [(f.name, f.read()) for f in uploaded]
+
+    # Download button at top
     zip_out = io.BytesIO()
     with zipfile.ZipFile(zip_out, 'w') as zf:
-        for f in uploaded:
-            buf = create_zip(f.read(), patterns, prefix, suffix)
-            # merge each individual zip into the main one:
-            for info in zipfile.ZipFile(buf).infolist():
-                zf.writestr(info.filename, zipfile.ZipFile(buf).read(info.filename))
+        for orig_name, pdf_bytes in uploads:
+            buf = create_zip(pdf_bytes, patterns, prefix, suffix)
+            with zipfile.ZipFile(buf) as part_zip:
+                for info in part_zip.infolist():
+                    zf.writestr(info.filename, part_zip.read(info.filename))
     zip_out.seek(0)
-    st.download_button(
-        'Download all splits',
-        zip_out,
-        file_name='acc_build_forms.zip'
-    )
+    st.download_button('Download all splits', zip_out, file_name='acc_build_forms.zip')
+
+    # Live preview table
+    st.subheader('Filename Preview')
+    table = []
+    for orig_name, pdf_bytes in uploads:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        entries = parse_toc(reader, detect_toc_pages(reader))
+        for name, start, end in split_forms(reader, entries):
+            clean = name
+            for rx in patterns:
+                clean = re.sub(rx, '', clean, flags=re.IGNORECASE)
+            fname = slugify(clean)
+            table.append({
+                'Form Name': name,
+                'Pages': f"{start}-{end}",
+                'Filename': f"{prefix}{fname}{suffix}.pdf"
+            })
+    df = pd.DataFrame(table)
+    st.dataframe(df, width=900)
+
 
     # **Live preview** table:
     st.subheader('Filename Preview')
