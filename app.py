@@ -1,4 +1,3 @@
-```python
 import re
 import io
 import zipfile
@@ -109,4 +108,4 @@ if uploaded:
                     zf.writestr(info.filename, zipfile.ZipFile(buf).read(info.filename))
         out.seek(0)
         st.download_button("Download ZIP", out, file_name="acc_build_forms.zip")
-```
+
