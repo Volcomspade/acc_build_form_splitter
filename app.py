@@ -1,3 +1,4 @@
+```python
 import re
 import io
 import zipfile
@@ -14,11 +15,12 @@ def detect_toc_pages(reader):
             if entry_rx.search(p.extract_text() or "")]
 
 def parse_toc(reader, toc_pages):
-    rx = re.compile(r'#\s*\d+:\s*(.+?)\s+(\d+)', re.MULTILINE)
+    # Extract form names and start pages from TOC lines using dot leaders
+    pattern = re.compile(r'#\s*\d+:\s*(.*?)\s*\.\.\.\s*(\d+)', re.MULTILINE)
     entries = []
     for pg in toc_pages:
         text = reader.pages[pg-1].extract_text() or ""
-        for m in rx.finditer(text):
+        for m in pattern.finditer(text):
             entries.append((m.group(1).strip(), int(m.group(2))))
     return entries
 
@@ -108,4 +110,4 @@ if uploaded:
                     zf.writestr(info.filename, zipfile.ZipFile(buf).read(info.filename))
         out.seek(0)
         st.download_button("Download ZIP", out, file_name="acc_build_forms.zip")
-
+```
