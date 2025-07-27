@@ -2,7 +2,6 @@ import re
 import io
 import zipfile
 
-
 import streamlit as st
 import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
@@ -94,7 +93,6 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as zf:
         for raw, start, end in splits:
-            # Determine actual form title
             title = get_form_title(reader, start, remove_id)
             clean = title
             for rx in patterns:
@@ -107,55 +105,4 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
             part_pdf = io.BytesIO()
             writer.write(part_pdf)
             part_pdf.seek(0)
-            zf.writestr(f"{prefix}{fname}{suffix}.pdf", part_pdf.read())
-    buf.seek(0)
-    return buf
-
-# --- Streamlit UI ---
-
-st.set_page_config(page_title="ACC Build TOC Splitter")
-st.title("ACC Build TOC Splitter")
-
-uploads = st.file_uploader("Upload ACC Build PDF(s)", type="pdf", accept_multiple_files=True)
-remove_input = st.text_input("Remove patterns (* wildcards or regex)", "")
-prefix = st.text_input("Filename prefix", "")
-suffix = st.text_input("Filename suffix", "")
-remove_id = st.checkbox("Remove numeric ID prefix", value=True)
-patterns = build_patterns(remove_input)
-
-if uploads:
-    # Read all uploaded files once into memory
-    file_bytes_list = [f.getvalue() for f in uploads]
-
-    # Generate combined ZIP
-    zip_out = io.BytesIO()
-    with zipfile.ZipFile(zip_out, 'w') as zf:
-        for pdf_bytes in file_bytes_list:
-            part_bytes = create_zip(pdf_bytes, patterns, prefix, suffix, remove_id)
-            with zipfile.ZipFile(part_bytes) as part_zip:
-                for info in part_zip.infolist():
-                    zf.writestr(info.filename, part_zip.read(info.filename))
-    zip_out.seek(0)
-    st.download_button('Download all splits', zip_out, file_name='acc_build_forms.zip', mime='application/zip')
-
-    # Live preview of output filenames and page ranges
-    st.subheader("Filename Preview")
-    rows = []
-    for pdf_bytes in file_bytes_list:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        total_pages = len(reader.pages)
-        toc_entries = parse_toc(reader, detect_toc_pages(reader))
-        splits = split_forms(toc_entries, total_pages)
-        for _, pg_start, pg_end in splits:
-            title = get_form_title(reader, pg_start, remove_id)
-            clean = title
-            for rx in patterns:
-                clean = re.sub(rx, '', clean, flags=re.IGNORECASE)
-            fname = slugify(clean)
-            rows.append({
-                'Form Title': title,
-                'Pages': f"{pg_start}-{pg_end}",
-                'Filename': f"{prefix}{fname}{suffix}.pdf"
-            })
-    df = pd.DataFrame(rows)
-    st.dataframe(df, width=900)
+            zf.writestr(f"{prefix}{f
