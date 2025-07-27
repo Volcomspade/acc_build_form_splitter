@@ -39,20 +39,31 @@ def parse_toc(reader, toc_pages):
 
 def get_form_title(reader, page_no, remove_id=True):
     """
-    From the form's first page, extract the first non-empty line (the blue heading).
-    Optionally strip leading '# 1234:' IDs.
+    From the form’s first page, extract the blue heading, i.e. the first line
+    beginning with ‘#’.  Skip any site‑header lines like ‘400060 – Wizard BESS’.
+    Optionally strip off the ‘# 1234:’ prefix.
     """
     text = reader.pages[page_no - 1].extract_text() or ""
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if remove_id:
-            # Remove '# 1234:' or '#1234' prefix
-            return re.sub(r'^#\s*\d+:?\s*', '', line)
-        return line
-    return f"Page_{page_no}"
+    # collect all non‑empty lines
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
+    # 1) First look for the blue heading line (starts with '#')
+    for ln in lines:
+        if ln.startswith("#"):
+            if remove_id:
+                return re.sub(r'^#\s*\d+:?\s*', '', ln)
+            return ln
+
+    # 2) Fallback: if nothing starts with '#', skip any pure‑numeric headers
+    header_rx = re.compile(r'^\d+\s*[-–]\s*.+$')
+    for ln in lines:
+        if header_rx.match(ln):
+            continue
+        # take the first “real” line
+        return ln
+
+    # 3) Ultimate fallback
+    return f"Page_{page_no}"
 
 def slugify(name):
     """
