@@ -91,6 +91,7 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
     splits = split_forms(entries, total_pages)
 
     buf = io.BytesIO()
+    buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as zf:
         for raw, start, end in splits:
             title = get_form_title(reader, start, remove_id)
@@ -98,11 +99,15 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
             for rx in patterns:
                 clean = re.sub(rx, '', clean, flags=re.IGNORECASE)
             fname = slugify(clean)
-
+    
             writer = PdfWriter()
             for p in range(start-1, end):
                 writer.add_page(reader.pages[p])
             part_pdf = io.BytesIO()
             writer.write(part_pdf)
             part_pdf.seek(0)
-            zf.writestr(f"{prefix}{fname}{suffix}.pdf", part_pdf.read())
+    
+            zf.writestr(f"{prefix}{fname}{suffix}.pdf",
+                        part_pdf.read())
+    buf.seek(0)
+
