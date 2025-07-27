@@ -1,4 +1,3 @@
-```python
 import re
 import io
 import zipfile
@@ -171,4 +170,4 @@ if uploads:
             })
     df = pd.DataFrame(preview)
     st.dataframe(df, use_container_width=True)
-```
+
