@@ -105,4 +105,4 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
             part_pdf = io.BytesIO()
             writer.write(part_pdf)
             part_pdf.seek(0)
-            zf.writestr(f"{prefix}{f
+            zf.writestr(f"{prefix}{fname}{suffix}.pdf", part_pdf.read())
