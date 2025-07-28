@@ -10,37 +10,40 @@ from PyPDF2 import PdfReader, PdfWriter
 
 def detect_toc_pages(reader):
     """
-    Read pages in order; collect pages where a TOC entry (# 1234:) appears,
-    then stop as soon as we hit a page without any.
+    Return the contiguous block of pages that contain TOC entries
+    (lines starting “# 1234:”).
     """
     entry_rx = re.compile(r'^#\s*\d+:', re.MULTILINE)
-    toc = []
+    pages = []
     for i, page in enumerate(reader.pages):
         text = page.extract_text() or ""
         if entry_rx.search(text):
-            toc.append(i + 1)
-        elif toc:
+            pages.append(i + 1)
+        elif pages:
+            # once we've started collecting, stop on the first non‑TOC page
             break
-    return toc
+    return pages
 
 def parse_toc(reader, toc_pages):
     """
-    From those TOC pages, pull out (# 7893: Form Name .... 15) entries.
-    Returns list of (raw_title, start_page).
+    From each TOC page, extract lines like:
+      # 7893: Form Name ………………… 15
+    Returns [(raw_title, start_page), …].
     """
     pattern = re.compile(r'#\s*\d+:\s*(.*?)\.*\s+(\d+)', re.MULTILINE)
-    out = []
+    results = []
     for pg in toc_pages:
         text = reader.pages[pg-1].extract_text() or ""
         for m in pattern.finditer(text):
             raw = m.group(1).strip()
             start = int(m.group(2))
-            out.append((raw, start))
-    return out
+            results.append((raw, start))
+    return results
 
 def split_forms(entries, total_pages):
     """
-    Turn [(raw, start), …] into [(raw, start, end), …].
+    Given [(raw, start), …], return [(raw, start, end), …]
+    where end = next_start −1, or total_pages for the last.
     """
     splits = []
     for i, (raw, start) in enumerate(entries):
@@ -48,57 +51,55 @@ def split_forms(entries, total_pages):
         splits.append((raw, start, end))
     return splits
 
-def slugify(name):
-    """
-    Clean up a string to be a safe filename.
-    """
-    s = re.sub(r'[\\/:*?"<>|]', '', name)
-    s = re.sub(r'\s+', '_', s)
-    return re.sub(r'_+', '_', s).strip('_')
+def slugify(s):
+    """Make a filesystem‑safe filename."""
+    safe = re.sub(r'[\\/:*?"<>|]', '', s)
+    safe = re.sub(r'\s+', '_', safe)
+    return re.sub(r'_+', '_', safe).strip('_')
 
-def build_patterns(raw_input):
+def build_patterns(txt):
     """
-    Comma‑separated wildcards/regex → [regex…]
+    “a*,b” → [r’a.*’, r'b'] so you can re.sub(rx, '', …).
     """
-    pats = []
-    for tok in [t.strip() for t in raw_input.split(',') if t.strip()]:
+    out = []
+    for tok in [t.strip() for t in txt.split(',') if t.strip()]:
         if '*' in tok:
             esc = re.escape(tok)
-            pats.append(esc.replace(r'\*', '.*'))
+            out.append(esc.replace(r'\*', '.*'))
         else:
-            pats.append(tok)
-    return pats
+            out.append(tok)
+    return out
 
 def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
     reader = PdfReader(io.BytesIO(pdf_bytes))
     total = len(reader.pages)
 
-    # 1) find TOC pages
     toc_pages = detect_toc_pages(reader)
-
-    # 2) parse raw titles & start pages
-    entries = parse_toc(reader, toc_pages)
-
-    # 3) compute (raw, start, end)
-    splits = split_forms(entries, total)
+    entries   = parse_toc(reader, toc_pages)
+    splits    = split_forms(entries, total)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as zf:
         for raw, start, end in splits:
-            # raw is already the TOC form name
-            title = raw
-            clean = title
+            # optionally strip off the leading "#1234: "
+            name = re.sub(r'^#\s*\d+:?\s*', '', raw) if remove_id else raw
+
+            # apply any remove‑patterns
             for rx in patterns:
-                clean = re.sub(rx, '', clean, flags=re.IGNORECASE)
-            fname = slugify(clean)
+                name = re.sub(rx, '', name, flags=re.IGNORECASE)
+
+            fname = slugify(name)
+            full_name = f"{prefix}{fname}{suffix}.pdf"
 
             writer = PdfWriter()
             for p in range(start-1, end):
                 writer.add_page(reader.pages[p])
+
             part = io.BytesIO()
             writer.write(part)
             part.seek(0)
-            zf.writestr(f"{prefix}{fname}{suffix}.pdf", part.read())
+            zf.writestr(full_name, part.read())
+
     buf.seek(0)
     return buf
 
@@ -107,61 +108,56 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
 st.set_page_config(page_title="ACC Build TOC Splitter")
 st.title("ACC Build TOC Splitter")
 
-uploads = st.file_uploader(
-    "Upload ACC Build PDF(s)",
-    type="pdf",
-    accept_multiple_files=True
-)
-remove_input = st.text_input("Remove patterns (* wildcards or regex)", "")
-prefix      = st.text_input("Filename prefix", "")
-suffix      = st.text_input("Filename suffix", "")
-remove_id   = st.checkbox("Remove numeric ID prefix (TOC‑derived names have no '#' anyway)", value=True)
-patterns    = build_patterns(remove_input)
+uploads    = st.file_uploader("Upload ACC Build PDF(s)", type="pdf", accept_multiple_files=True)
+remove_txt = st.text_input("Remove patterns (* wildcards or regex)", "")
+prefix     = st.text_input("Filename prefix", "")
+suffix     = st.text_input("Filename suffix", "")
+remove_id  = st.checkbox("Remove numeric ID prefix (#1234:) from filenames", value=True)
+
+patterns = build_patterns(remove_txt)
 
 if uploads:
-    # read bytes once
-    file_bytes_list = [f.getvalue() for f in uploads]
+    # load all bytes once
+    pdfs = [f.getvalue() for f in uploads]
 
-    # --- combined ZIP download ---
+    # --- Download All ZIP ---
     master = io.BytesIO()
     with zipfile.ZipFile(master, 'w') as mz:
-        for pdf_bytes in file_bytes_list:
-            subzip = create_zip(pdf_bytes, patterns, prefix, suffix, remove_id)
-            with zipfile.ZipFile(subzip) as sz:
-                for info in sz.infolist():
-                    mz.writestr(info.filename, sz.read(info.filename))
+        for pdf_bytes in pdfs:
+            sz = create_zip(pdf_bytes, patterns, prefix, suffix, remove_id)
+            with zipfile.ZipFile(sz) as part:
+                for info in part.infolist():
+                    mz.writestr(info.filename, part.read(info.filename))
     master.seek(0)
-    st.download_button(
-        "Download all splits",
-        master,
-        file_name="acc_build_forms.zip",
-        mime="application/zip"
-    )
+    st.download_button("Download all splits", master, "acc_build_forms.zip", "application/zip")
 
-    # --- Live preview with progress bar ---
+    # --- Live Preview with Progress ---
     st.subheader("Filename & Page‑Range Preview")
-    rows = []
-    total_forms = 0
-    # first count total splits so we can show meaningful progress
-    for pdf_bytes in file_bytes_list:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        toc = parse_toc(reader, detect_toc_pages(reader))
-        total_forms += len(toc)
 
-    progress = st.progress(0)
+    # count total splits for progress bar
+    total_splits = 0
+    for pdf_bytes in pdfs:
+        r = PdfReader(io.BytesIO(pdf_bytes))
+        total_splits += len(parse_toc(r, detect_toc_pages(r)))
+
+    prog = st.progress(0)
     done = 0
+    rows = []
 
-    for pdf_bytes in file_bytes_list:
+    for pdf_bytes in pdfs:
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        total = len(reader.pages)
+        total  = len(reader.pages)
         entries = parse_toc(reader, detect_toc_pages(reader))
         splits  = split_forms(entries, total)
 
         for raw, start, end in splits:
-            clean = raw
+            # raw TOC title
+            display = re.sub(r'^#\s*\d+:?\s*', '', raw) if remove_id else raw
+            name = display
             for rx in patterns:
-                clean = re.sub(rx, '', clean, flags=re.IGNORECASE)
-            fname = slugify(clean)
+                name = re.sub(rx, '', name, flags=re.IGNORECASE)
+            fname = slugify(name)
+
             rows.append({
                 "Form Name": raw,
                 "Pages":     f"{start}-{end}",
@@ -169,7 +165,7 @@ if uploads:
             })
 
             done += 1
-            progress.progress(int(done/total_forms * 100))
+            prog.progress(int(done/total_splits * 100))
 
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
-    progress.empty()
+    prog.empty()
