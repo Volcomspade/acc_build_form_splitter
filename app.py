@@ -9,9 +9,6 @@ from PyPDF2 import PdfReader, PdfWriter
 # --- PDF splitting logic ---
 
 def detect_toc_pages(reader):
-    """
-    Identify pages containing TOC entries (lines starting with '# 1234:').
-    """
     entry_rx = re.compile(r'^#\s*\d+:', re.MULTILINE)
     return [
         i + 1
@@ -19,178 +16,124 @@ def detect_toc_pages(reader):
         if entry_rx.search(p.extract_text() or "")
     ]
 
-
 def parse_toc(reader, toc_pages):
     """
-    Parse TOC pages for entries of the form:
-      # 7893: Form Name ........ 15
-    Returns a list of (raw_title, start_page).
+    Extracts (title, start_page) from lines like:
+      #6849: ACC/DCC-D4.1 (P23459AD0003): 03.04 Exhibit H-3 - Exhibit H-4 ACC Build  ......... 4
     """
-    pattern = re.compile(r'#\s*\d+:\s*(.*?)\.*\s+(\d+)', re.MULTILINE)
+    # group1 = the full title after the colon up to the dot leaders
+    toc_pattern = re.compile(r'#\s*\d+:\s*(.+?)\s*\.{3,}\s*(\d+)', re.MULTILINE)
     entries = []
     for pg in toc_pages:
-        text = reader.pages[pg - 1].extract_text() or ""
-        for m in pattern.finditer(text):
-            entries.append((m.group(1).strip(), int(m.group(2))))
+        text = reader.pages[pg-1].extract_text() or ""
+        for m in toc_pattern.finditer(text):
+            title = m.group(1).strip()
+            start = int(m.group(2))
+            entries.append((title, start))
     return entries
 
-
-def get_form_title(reader, page_no, remove_id=True, debug=False):
+def split_ranges(entries, total_pages):
     """
-    From the form's first page, look for the blue heading "#1234: …".
-    If none is found, fall back to first non-empty line.
-    If debug=True, dump the raw page text into the app.
+    Turns [(title, start), ...] into [(title, start, end), ...].
     """
-    text = reader.pages[page_no - 1].extract_text() or ""
-
-    if debug:
-        st.markdown(f"---\n**Debug: raw text for page {page_no}:**")
-        st.text_area(f"Page {page_no} text", text, height=200)
-
-    # 1) try to find the blue heading
-    for line in text.splitlines():
-        line = line.strip()
-        if re.match(r'^#\s*\d+:', line):
-            if remove_id:
-                return re.sub(r'^#\s*\d+:?\s*', '', line).strip()
-            else:
-                return line
-
-    # 2) fallback to very first non-empty line
-    for line in text.splitlines():
-        line = line.strip()
-        if line:
-            if remove_id:
-                return re.sub(r'^#\s*\d+:?\s*', '', line).strip()
-            return line
-
-    return f"Page_{page_no}"
-
+    out = []
+    for idx, (title, start) in enumerate(entries):
+        end = entries[idx+1][1] - 1 if idx+1 < len(entries) else total_pages
+        out.append((title, start, end))
+    return out
 
 def slugify(name):
-    """
-    Sanitize a string for use as a filename.
-    """
     s = re.sub(r'[\\/:*?"<>|]', '', name)
     s = re.sub(r'\s+', '_', s)
     return re.sub(r'_+', '_', s).strip('_')
 
-
-def build_patterns(raw_input):
-    """
-    Turn comma-separated wildcards/regex into a list of regex patterns.
-    """
+def build_patterns(raw):
     pats = []
-    for token in [t.strip() for t in raw_input.split(',') if t.strip()]:
-        if '*' in token:
-            esc = re.escape(token)
-            token_re = esc.replace(r'\*', '.*')
+    for tok in [t.strip() for t in raw.split(',') if t.strip()]:
+        if '*' in tok:
+            esc = re.escape(tok)
+            pats.append(esc.replace(r'\*','.*'))
         else:
-            token_re = token
-        pats.append(token_re)
+            pats.append(tok)
     return pats
 
-
-def split_forms(entries, total_pages):
-    """
-    Given [(raw, start), ...], compute [(raw, start, end), ...] page ranges.
-    """
-    splits = []
-    for i, (raw, start) in enumerate(entries):
-        end = entries[i + 1][1] - 1 if i + 1 < len(entries) else total_pages
-        splits.append((raw, start, end))
-    return splits
-
-
-def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
-    """
-    Split a single PDF according to its TOC and pack into an in-memory ZIP.
-    """
+def create_zip(pdf_bytes, patterns, prefix, suffix, remove_hash):
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    total_pages = len(reader.pages)
+    total = len(reader.pages)
     toc_pages = detect_toc_pages(reader)
-    entries = parse_toc(reader, toc_pages)
-    splits = split_forms(entries, total_pages)
+    toc_entries = parse_toc(reader, toc_pages)
+    splits = split_ranges(toc_entries, total)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as zf:
-        for raw, start, end in splits:
-            title = get_form_title(reader, start, remove_id)
-            clean = title
+        for title, start, end in splits:
+            # optionally strip leading "#" if they want
+            name = title.lstrip('# ') if remove_hash else title
+            # apply user patterns
             for rx in patterns:
-                clean = re.sub(rx, '', clean, flags=re.IGNORECASE)
-            fname = slugify(clean)
+                name = re.sub(rx, '', name, flags=re.IGNORECASE)
+            fname = slugify(name)
 
             writer = PdfWriter()
-            for p in range(start - 1, end):
+            for p in range(start-1, end):
                 writer.add_page(reader.pages[p])
-            part_pdf = io.BytesIO()
-            writer.write(part_pdf)
-            part_pdf.seek(0)
+            part = io.BytesIO()
+            writer.write(part)
+            part.seek(0)
 
-            zf.writestr(f"{prefix}{fname}{suffix}.pdf", part_pdf.read())
+            zf.writestr(f"{prefix}{fname}{suffix}.pdf", part.read())
+
     buf.seek(0)
     return buf
-
 
 # --- Streamlit UI ---
 
 st.set_page_config(page_title="ACC Build TOC Splitter")
 st.title("ACC Build TOC Splitter")
 
-uploads = st.file_uploader(
-    "Upload ACC Build PDF(s)", type="pdf", accept_multiple_files=True
-)
-remove_input = st.text_input("Remove patterns (* wildcards or regex)", "")
-prefix = st.text_input("Filename prefix", "")
-suffix = st.text_input("Filename suffix", "")
-remove_id = st.checkbox("Remove numeric ID prefix", value=True)
-debug = st.checkbox("🔧 Debug raw page text", value=False)
-patterns = build_patterns(remove_input)
+uploads = st.file_uploader("Upload ACC Build PDF(s)", type="pdf", accept_multiple_files=True)
+remove_input = st.text_input("Remove patterns (* or regex)", "")
+prefix        = st.text_input("Filename prefix", "")
+suffix        = st.text_input("Filename suffix", "")
+remove_hash   = st.checkbox("Remove leading ‘#’ from TOC titles", value=True)
+patterns      = build_patterns(remove_input)
 
 if uploads:
-    # read uploads into memory
-    file_bytes_list = [f.read() for f in uploads]
+    # Read in all PDFs
+    pdfs = [f.read() for f in uploads]
 
     # Build master ZIP
     master = io.BytesIO()
     with zipfile.ZipFile(master, 'w') as mz:
-        for pdf_bytes in file_bytes_list:
-            subzip = create_zip(pdf_bytes, patterns, prefix, suffix, remove_id)
-            with zipfile.ZipFile(subzip) as sz:
+        for pdf_bytes in pdfs:
+            sub = create_zip(pdf_bytes, patterns, prefix, suffix, remove_hash)
+            with zipfile.ZipFile(sub) as sz:
                 for info in sz.infolist():
                     mz.writestr(info.filename, sz.read(info.filename))
     master.seek(0)
 
-    st.download_button(
-        "Download all splits",
-        master,
-        file_name="acc_build_forms.zip",
-        mime="application/zip",
-    )
+    st.download_button("Download all splits", master, file_name="acc_build_forms.zip", mime="application/zip")
 
-    # Live preview
+    # Preview table
     st.subheader("Filename & Page-Range Preview")
-    preview = []
-    for idx, pdf_bytes in enumerate(file_bytes_list):
-        reader = PdfReader(io.BytesIO(pdf_bytes))
+    rows = []
+    for idx, pdf_bytes in enumerate(pdfs):
+        reader      = PdfReader(io.BytesIO(pdf_bytes))
         total_pages = len(reader.pages)
-        entries = parse_toc(reader, detect_toc_pages(reader))
-        splits = split_forms(entries, total_pages)
+        entries     = parse_toc(reader, detect_toc_pages(reader))
+        splits      = split_ranges(entries, total_pages)
 
-        for raw, start, end in splits:
-            title = get_form_title(reader, start, remove_id, debug=debug)
-            clean = title
+        for title, start, end in splits:
+            name = title.lstrip('# ') if remove_hash else title
             for rx in patterns:
-                clean = re.sub(rx, '', clean, flags=re.IGNORECASE)
-            fname = slugify(clean)
+                name = re.sub(rx, '', name, flags=re.IGNORECASE)
+            fname = slugify(name)
 
-            preview.append({
+            rows.append({
                 "Source PDF": uploads[idx].name,
                 "Form Name": title,
                 "Pages": f"{start}-{end}",
-                "Filename": f"{prefix}{fname}{suffix}.pdf",
+                "Filename": f"{prefix}{fname}{suffix}.pdf"
             })
 
-    df = pd.DataFrame(preview)
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
