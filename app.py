@@ -6,100 +6,69 @@ import streamlit as st
 import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
 
-# --- PDF splitting logic ---
+# --- PDF splitting logic based on TOC only ---
 
 def detect_toc_pages(reader):
-    """
-    Return the contiguous block of pages that contain TOC entries
-    (lines starting “# 1234:”).
-    """
+    """Return list of page indices (1‑based) where a TOC lives."""
     entry_rx = re.compile(r'^#\s*\d+:', re.MULTILINE)
-    pages = []
-    for i, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        if entry_rx.search(text):
-            pages.append(i + 1)
-        elif pages:
-            # once we've started collecting, stop on the first non‑TOC page
-            break
-    return pages
+    return [i + 1 for i, p in enumerate(reader.pages)
+            if entry_rx.search(p.extract_text() or "")]
 
 def parse_toc(reader, toc_pages):
     """
-    From each TOC page, extract lines like:
-      # 7893: Form Name ………………… 15
-    Returns [(raw_title, start_page), …].
+    From each TOC page, pull entries of the form:
+        # 7893: Form name ……………………….. 15
+    Returns list of (raw_title, start_page).
     """
-    pattern = re.compile(r'#\s*\d+:\s*(.*?)\.*\s+(\d+)', re.MULTILINE)
-    results = []
+    pattern = re.compile(r'#\s*(\d+):\s*(.*?)\.*\s+(\d+)', re.MULTILINE)
+    entries = []
     for pg in toc_pages:
         text = reader.pages[pg-1].extract_text() or ""
         for m in pattern.finditer(text):
-            raw = m.group(1).strip()
-            start = int(m.group(2))
-            results.append((raw, start))
-    return results
+            full_id = m.group(1)
+            title   = m.group(2).strip()
+            start   = int(m.group(3))
+            raw     = f"#{full_id}: {title}"
+            entries.append((raw, start))
+    # sort by page just in case
+    return sorted(entries, key=lambda x: x[1])
 
-def split_forms(entries, total_pages):
+def split_ranges(entries, total_pages):
     """
-    Given [(raw, start), …], return [(raw, start, end), …]
-    where end = next_start −1, or total_pages for the last.
-    """
-    splits = []
-    for i, (raw, start) in enumerate(entries):
-        end = entries[i+1][1] - 1 if i+1 < len(entries) else total_pages
-        splits.append((raw, start, end))
-    return splits
-
-def slugify(s):
-    """Make a filesystem‑safe filename."""
-    safe = re.sub(r'[\\/:*?"<>|]', '', s)
-    safe = re.sub(r'\s+', '_', safe)
-    return re.sub(r'_+', '_', safe).strip('_')
-
-def build_patterns(txt):
-    """
-    “a*,b” → [r’a.*’, r'b'] so you can re.sub(rx, '', …).
+    Turn [(raw, start), …] into [(raw, start, end), …],
+    where end = next_start−1 or last page.
     """
     out = []
-    for tok in [t.strip() for t in txt.split(',') if t.strip()]:
-        if '*' in tok:
-            esc = re.escape(tok)
-            out.append(esc.replace(r'\*', '.*'))
-        else:
-            out.append(tok)
+    for i, (raw, start) in enumerate(entries):
+        end = entries[i+1][1] - 1 if i+1 < len(entries) else total_pages
+        out.append((raw, start, end))
     return out
 
-def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
+def make_zip(pdf_bytes, splits, patterns, prefix, suffix, remove_id):
+    """
+    Given pre‑computed splits list, build an in‑memory ZIP of each form PDF.
+    """
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    total = len(reader.pages)
-
-    toc_pages = detect_toc_pages(reader)
-    entries   = parse_toc(reader, toc_pages)
-    splits    = split_forms(entries, total)
-
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as zf:
         for raw, start, end in splits:
-            # optionally strip off the leading "#1234: "
-            name = re.sub(r'^#\s*\d+:?\s*', '', raw) if remove_id else raw
-
-            # apply any remove‑patterns
+            name = raw
+            if remove_id:
+                name = re.sub(r'^#\s*\d+:?\s*', '', name)
+            # apply user patterns
             for rx in patterns:
                 name = re.sub(rx, '', name, flags=re.IGNORECASE)
-
-            fname = slugify(name)
-            full_name = f"{prefix}{fname}{suffix}.pdf"
+            # sanitize
+            fname = re.sub(r'[\\/:*?"<>|]', '', name).strip()
+            fname = re.sub(r'\s+', '_', fname)
+            full_fname = f"{prefix}{fname}{suffix}.pdf"
 
             writer = PdfWriter()
             for p in range(start-1, end):
                 writer.add_page(reader.pages[p])
-
             part = io.BytesIO()
             writer.write(part)
-            part.seek(0)
-            zf.writestr(full_name, part.read())
-
+            zf.writestr(full_fname, part.getvalue())
     buf.seek(0)
     return buf
 
@@ -108,64 +77,86 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
 st.set_page_config(page_title="ACC Build TOC Splitter")
 st.title("ACC Build TOC Splitter")
 
-uploads    = st.file_uploader("Upload ACC Build PDF(s)", type="pdf", accept_multiple_files=True)
-remove_txt = st.text_input("Remove patterns (* wildcards or regex)", "")
-prefix     = st.text_input("Filename prefix", "")
-suffix     = st.text_input("Filename suffix", "")
-remove_id  = st.checkbox("Remove numeric ID prefix (#1234:) from filenames", value=True)
-
-patterns = build_patterns(remove_txt)
+uploads     = st.file_uploader("Upload ACC Build PDF(s)", type="pdf", accept_multiple_files=True)
+remove_txt  = st.text_input("Remove patterns (* wildcard or regex)", "")
+prefix      = st.text_input("Filename prefix", "")
+suffix      = st.text_input("Filename suffix", "")
+remove_id   = st.checkbox("Remove numeric ID prefix (e.g. “#6849:”) ", value=True)
+patterns    = []
+for tok in [t.strip() for t in remove_txt.split(',') if t.strip()]:
+    if '*' in tok:
+        esc = re.escape(tok)
+        patterns.append(esc.replace(r'\*', '.*'))
+    else:
+        patterns.append(tok)
 
 if uploads:
-    # load all bytes once
-    pdfs = [f.getvalue() for f in uploads]
+    # read each PDF once
+    pdf_bytes_list = [f.read() for f in uploads]
 
-    # --- Download All ZIP ---
-    master = io.BytesIO()
-    with zipfile.ZipFile(master, 'w') as mz:
-        for pdf_bytes in pdfs:
-            sz = create_zip(pdf_bytes, patterns, prefix, suffix, remove_id)
-            with zipfile.ZipFile(sz) as part:
-                for info in part.infolist():
-                    mz.writestr(info.filename, part.read(info.filename))
-    master.seek(0)
-    st.download_button("Download all splits", master, "acc_build_forms.zip", "application/zip")
-
-    # --- Live Preview with Progress ---
+    # --- Preview Generation with Progress Bar ---
     st.subheader("Filename & Page‑Range Preview")
+    progress = st.progress(0)
+    preview_rows = []
 
-    # count total splits for progress bar
-    total_splits = 0
-    for pdf_bytes in pdfs:
-        r = PdfReader(io.BytesIO(pdf_bytes))
-        total_splits += len(parse_toc(r, detect_toc_pages(r)))
-
-    prog = st.progress(0)
-    done = 0
-    rows = []
-
-    for pdf_bytes in pdfs:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        total  = len(reader.pages)
-        entries = parse_toc(reader, detect_toc_pages(reader))
-        splits  = split_forms(entries, total)
+    for idx, pdf_bytes in enumerate(pdf_bytes_list):
+        reader      = PdfReader(io.BytesIO(pdf_bytes))
+        total_pages = len(reader.pages)
+        toc_pages   = detect_toc_pages(reader)
+        toc_entries = parse_toc(reader, toc_pages)
+        splits      = split_ranges(toc_entries, total_pages)
 
         for raw, start, end in splits:
-            # raw TOC title
-            display = re.sub(r'^#\s*\d+:?\s*', '', raw) if remove_id else raw
-            name = display
+            name = raw
+            if remove_id:
+                name = re.sub(r'^#\s*\d+:?\s*', '', name)
             for rx in patterns:
                 name = re.sub(rx, '', name, flags=re.IGNORECASE)
-            fname = slugify(name)
+            clean = re.sub(r'\s+', '_', name.strip())
+            clean = re.sub(r'[\\/:*?"<>|]', '', clean)
+            fname = f"{prefix}{clean}{suffix}.pdf"
 
-            rows.append({
-                "Form Name": raw,
-                "Pages":     f"{start}-{end}",
-                "Filename":  f"{prefix}{fname}{suffix}.pdf"
+            preview_rows.append({
+                "Source PDF": uploads[idx].name,
+                "Form Name":  raw,
+                "Pages":      f"{start}–{end}",
+                "Filename":   fname,
             })
 
-            done += 1
-            prog.progress(int(done/total_splits * 100))
+        progress.progress((idx + 1) / len(pdf_bytes_list))
 
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
-    prog.empty()
+    df = pd.DataFrame(preview_rows)
+    # highlight duplicates in Filename
+    dup_mask = df["Filename"].duplicated(keep=False)
+    def highlight_dups(val, is_dup):
+        return "color: red;" if is_dup else ""
+    styled = (
+        df.style
+          .apply(lambda col: [highlight_dups(v, is_dup) 
+                              for v, is_dup in zip(col, dup_mask)],
+                 axis=0, subset=["Filename"])
+    )
+    st.write(styled, unsafe_allow_html=True)
+
+    # --- ZIP Download ---
+    st.subheader("Generate & Download Splits")
+    if st.button("Build ZIP & Download"):
+        # build master zip
+        master = io.BytesIO()
+        with zipfile.ZipFile(master, 'w') as mz:
+            for pdf_bytes in pdf_bytes_list:
+                # reuse split logic
+                reader      = PdfReader(io.BytesIO(pdf_bytes))
+                total_pages = len(reader.pages)
+                splits      = split_ranges(parse_toc(reader, detect_toc_pages(reader)), total_pages)
+                part_zip    = make_zip(pdf_bytes, splits, patterns, prefix, suffix, remove_id)
+                with zipfile.ZipFile(part_zip) as z:
+                    for info in z.infolist():
+                        mz.writestr(info.filename, z.read(info.filename))
+        master.seek(0)
+        st.download_button(
+            "Download All Splits (ZIP)",
+            data=master,
+            file_name="acc_build_forms.zip",
+            mime="application/zip"
+        )
