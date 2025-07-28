@@ -23,25 +23,21 @@ def detect_toc_pages(reader):
     ]
 
 def parse_toc(reader, toc_pages):
-    """
-    Returns a list of tuples: (id_str, title_str, start_page)
-    """
-    toc_rx = re.compile(r'#\s*(\d+):\s*(.+?)\s*\.{3,}\s*(\d+)', re.MULTILINE)
+    toc_rx = re.compile(r'#\s*\d+:\s*(.+?)\s*\.{3,}\s*(\d+)', re.MULTILINE)
     entries = []
     for pg in toc_pages:
         txt = reader.pages[pg - 1].extract_text() or ""
         for m in toc_rx.finditer(txt):
-            id_str    = m.group(1)
-            title_str = m.group(2).strip()
-            start     = int(m.group(3))
-            entries.append((id_str, title_str, start))
+            title = m.group(1).strip()
+            start = int(m.group(2))
+            entries.append((title, start))
     return entries
 
 def split_ranges(entries, total_pages):
     out = []
-    for i, (id_str, title_str, start) in enumerate(entries):
-        end = entries[i+1][2] - 1 if i+1 < len(entries) else total_pages
-        out.append((id_str, title_str, start, end))
+    for i, (title, start) in enumerate(entries):
+        end = entries[i + 1][1] - 1 if i + 1 < len(entries) else total_pages
+        out.append((title, start, end))
     return out
 
 def slugify(name):
@@ -70,23 +66,22 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as zf:
-        for id_str, title_str, start, end in splits:
-            # The full form name with ID:
-            full_title = f"#{id_str}: {title_str}"
-            # Decide what to use for the filename base:
-            base_name = title_str if remove_id else full_title
+        for title, start, end in splits:
+            # optionally strip off "#1234: " prefix
+            name = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id else title
 
             # apply removal patterns
             for rx in patterns:
-                base_name = re.sub(rx, '', base_name, flags=re.IGNORECASE)
+                name = re.sub(rx, '', name, flags=re.IGNORECASE)
 
-            fname = slugify(base_name)
+            fname = slugify(name)
             writer = PdfWriter()
-            for p in range(start-1, end):
+            for p in range(start - 1, end):
                 writer.add_page(reader.pages[p])
             part = io.BytesIO()
             writer.write(part)
             part.seek(0)
+
             zf.writestr(f"{prefix}{fname}{suffix}.pdf", part.read())
 
     buf.seek(0)
@@ -96,32 +91,43 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
 
 st.title("ACC Build TOC Splitter")
 
-uploads          = st.file_uploader(
+uploads = st.file_uploader(
     "Upload ACC Build PDF(s)",
     type="pdf",
     accept_multiple_files=True,
 )
-remove_input     = st.text_input("Remove patterns (* wildcards or regex)", "")
-prefix           = st.text_input("Filename prefix", "")
-suffix           = st.text_input("Filename suffix", "")
+remove_input = st.text_input("Remove patterns (* wildcards or regex)", "")
+prefix = st.text_input("Filename prefix", "")
+suffix = st.text_input("Filename suffix", "")
 remove_id_prefix = st.checkbox(
     "Remove numeric ID prefix (e.g. ‘#6849: ’) from filenames",
     value=True
 )
+
+# ─── REGEX & WILDCARD HELPER ─────────────────────────────────────────────────
+with st.expander("ℹ️ Regex & wildcard tips"):
+    st.markdown("""
+    - Use `*` as a wildcard to match any sequence of characters.
+    - Separate multiple patterns with commas.
+    - Examples:
+        - `03.04*` removes any text starting with `03.04`
+        - `Exhibit H-*` removes anything from `Exhibit H-` onward
+        - `0?.0?` matches `03.04`, `02.03`, etc.
+    - Patterns are applied **case‑insensitive**.
+    """)
+
 patterns = build_patterns(remove_input)
 
 if uploads:
-    # Read all PDFs once
+    # read all once
     all_bytes = [f.read() for f in uploads]
 
-    # Build master ZIP
+    # build master ZIP
     master = io.BytesIO()
     with zipfile.ZipFile(master, 'w') as mz:
-        for pdf_bytes, upload in zip(all_bytes, uploads):
-            subzip = create_zip(
-                pdf_bytes, patterns, prefix, suffix, remove_id_prefix
-            )
-            with zipfile.ZipFile(subzip) as sz:
+        for b in all_bytes:
+            sub = create_zip(b, patterns, prefix, suffix, remove_id_prefix)
+            with zipfile.ZipFile(sub) as sz:
                 for info in sz.infolist():
                     mz.writestr(info.filename, sz.read(info.filename))
     master.seek(0)
@@ -130,30 +136,30 @@ if uploads:
         "Download all splits",
         master,
         file_name="acc_build_forms.zip",
-        mime="application/zip",
+        mime="application/zip"
     )
 
-    # Live preview
+    # live preview
     st.subheader("Filename & Page‑Range Preview")
     rows = []
-    for idx, pdf_bytes in enumerate(all_bytes):
-        reader      = PdfReader(io.BytesIO(pdf_bytes))
+    for idx, b in enumerate(all_bytes):
+        reader      = PdfReader(io.BytesIO(b))
         total_pages = len(reader.pages)
         entries     = parse_toc(reader, detect_toc_pages(reader))
         splits      = split_ranges(entries, total_pages)
 
-        for id_str, title_str, start, end in splits:
-            full_title = f"#{id_str}: {title_str}"
-            base_name  = title_str if remove_id_prefix else full_title
+        for title, start, end in splits:
+            # show original title in table, strip only for filename
+            name = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id_prefix else title
             for rx in patterns:
-                base_name = re.sub(rx, '', base_name, flags=re.IGNORECASE)
-            fname = slugify(base_name)
+                name = re.sub(rx, '', name, flags=re.IGNORECASE)
+            fname = slugify(name)
 
             rows.append({
                 "Source PDF": uploads[idx].name,
-                "Form Name":  full_title,
+                "Form Name":  title,
                 "Pages":      f"{start}-{end}",
-                "Filename":   f"{prefix}{fname}{suffix}.pdf",
+                "Filename":   f"{prefix}{fname}{suffix}.pdf"
             })
 
     df = pd.DataFrame(rows)
