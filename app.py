@@ -69,12 +69,10 @@ def extract_location_category(reader, start, end):
     """
     location = "Unknown"
     category = "Unknown"
-    # scan up to first 12 pages of the form (or until found)
     for i in range(start - 1, min(end, start - 1 + 12)):
         text = reader.pages[i].extract_text() or ""
         if "References and Attachments" in text:
-            # try to extract 'Category' and 'Location'
-            # Simple heuristics: find "Category" then capture next non-empty line/value
+            # attempt to grab Category and Location fields
             cat_match = re.search(r'Category\s*(?:\n|\s)+([A-Za-z0-9 >]+)', text)
             loc_match = re.search(r'Location\s*(?:\n|\s)+([A-Za-z0-9 >]+)', text)
             if cat_match:
@@ -83,6 +81,11 @@ def extract_location_category(reader, start, end):
                 location = loc_match.group(1).strip()
             break
     return location, category
+
+
+def split_hierarchy(s):
+    parts = [p.strip() for p in s.split('>') if p.strip()]
+    return parts if parts else ["Unknown"]
 
 
 def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id_prefix):
@@ -95,21 +98,23 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id_prefix):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as zf:
         for title, start, end in splits:
-            # Form name always retains ID
-            # Prepare filename base: optionally strip numeric ID prefix
+            # Form name always keeps ID (for display elsewhere)
+            # Filename base: optionally strip the "#1234: " prefix
             name_for_filename = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id_prefix else title
 
-            # apply removal patterns to the filename component
+            # apply removal patterns to the filename base
             for rx in patterns:
                 name_for_filename = re.sub(rx, '', name_for_filename, flags=re.IGNORECASE)
             fname = slugify(name_for_filename)
 
-            # determine folder path from metadata
+            # determine folder path from metadata (hierarchical)
             location, category = extract_location_category(reader, start, end)
-            folder_parts = [slugify(location) or "Unknown", slugify(category) or "Unknown"]
-            folder_path = "/".join(folder_parts)
+            loc_parts = split_hierarchy(location)
+            cat_parts = split_hierarchy(category)
+            folder_components = [slugify(p) for p in loc_parts + cat_parts]
+            folder_path = "/".join(folder_components)
 
-            # generate PDF for this split
+            # create the split PDF
             writer = PdfWriter()
             for p in range(start - 1, end):
                 writer.add_page(reader.pages[p])
@@ -140,15 +145,16 @@ remove_id_prefix = st.checkbox(
 )
 patterns = build_patterns(remove_input)
 
-# Regex helper
 with st.expander("🔎 Regex & wildcard tips", expanded=False):
     st.markdown(
         """
 **Basic usage:**
 - Comma-separated terms are treated as independent regex removals.
 - Use `*` as a wildcard (e.g., `03.*` will match `03.04`, `03.02`, etc.).
-- To remove variations like `03.02`, `02.03`, you can do things like `0[2-3]\.[0-4]` or use `0?.0?` with care: in regex `?` is a quantifier, so `.` is any character and `.*` is any stretch.  
-- Example to strip underscores or trailing artifacts: `_+` or `\s+`.
+- To remove variations like `03.02`, `02.03`, you can do things like `0[2-3]\.[0-4]` or use `.*` for broader matches.  
+- Examples:
+  - `03\.\d+` removes things like `03.04`, `03.02`.
+  - `_+` collapses repeated underscores.
 - Patterns are applied case-insensitively.
 """
     )
@@ -164,7 +170,6 @@ if uploads:
     status_placeholder = st.empty()
     progress_bar = st.progress(0)
 
-    # Read and parse each upload with progress
     for idx, f in enumerate(uploads):
         b = f.read()
         all_bytes.append(b)
@@ -192,7 +197,6 @@ if uploads:
     seconds = int(read_duration % 60)
     formatted_time = f"{minutes}:{seconds:02d}"
 
-    # Summary
     st.markdown("## Summary")
     cols = st.columns([1, 1, 1, 1.5])
     cols[0].metric("Total source PDFs", len(uploads))
@@ -204,7 +208,6 @@ if uploads:
     df_stats = pd.DataFrame(per_file_stats)
     st.dataframe(df_stats, use_container_width=True)
 
-    # Build master ZIP
     st.subheader("Assembling ZIP of splits")
     zip_status = st.empty()
     zip_status.markdown("Building ZIP...")
@@ -217,7 +220,7 @@ if uploads:
                     try:
                         mz.writestr(info.filename, sz.read(info.filename))
                     except Exception:
-                        pass  # tolerate duplicates or read issues
+                        pass
     master.seek(0)
     zip_status.markdown("ZIP ready.")
     st.download_button(
@@ -227,7 +230,6 @@ if uploads:
         mime="application/zip"
     )
 
-    # Live preview
     st.subheader("Filename & Page-Range Preview")
     preview_rows = []
     for idx, b in enumerate(all_bytes):
@@ -237,19 +239,15 @@ if uploads:
         splits = split_ranges(entries, total_pages_each)
 
         for title, start, end in splits:
-            # Form Name always includes the ID prefix
-            form_name = title
+            form_name = title  # keeps the ID prefix visible
 
-            # Derive folder metadata
             location, category = extract_location_category(reader, start, end)
             folder_display = f"{location} > {category}"
 
-            # Derive filename base (apply removal of ID if requested)
             name_for_filename = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id_prefix else title
             for rx in patterns:
                 name_for_filename = re.sub(rx, '', name_for_filename, flags=re.IGNORECASE)
             fname = slugify(name_for_filename)
-
             full_fname = f"{prefix}{fname}{suffix}.pdf"
 
             preview_rows.append({
