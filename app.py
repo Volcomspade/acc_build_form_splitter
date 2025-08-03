@@ -58,7 +58,7 @@ def build_patterns(raw_input):
         pats.append(esc)
     return pats
 
-def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
+def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id_filename):
     reader = PdfReader(io.BytesIO(pdf_bytes))
     total = len(reader.pages)
     toc_pages = detect_toc_pages(reader)
@@ -68,16 +68,16 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as zf:
         for title, start, end in splits:
-            # strip off "#1234: " if requested
-            name = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id else title
+            # Derive base name for filename: optionally strip "#1234: "
+            name_for_filename = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id_filename else title
 
-            # apply removal patterns
+            # apply removal patterns to filename base
             for rx in patterns:
-                name = re.sub(rx, '', name, flags=re.IGNORECASE)
+                name_for_filename = re.sub(rx, '', name_for_filename, flags=re.IGNORECASE)
 
-            fname = slugify(name)
+            fname = slugify(name_for_filename)
             writer = PdfWriter()
-            # guard against bad ranges
+            # guard against malformed ranges
             if start - 1 < 0:
                 continue
             for p in range(start - 1, end):
@@ -105,18 +105,19 @@ remove_input = st.text_input("Remove patterns (* wildcards or regex)", "")
 prefix = st.text_input("Filename prefix", "")
 suffix = st.text_input("Filename suffix", "")
 remove_id_prefix = st.checkbox(
-    "Remove numeric ID prefix (e.g. ‘#6849: ’)", value=True
+    "Remove numeric ID prefix (e.g. ‘#6849: ’) from filenames", value=True
 )
-# optional helper expansion
+
+# Regex/helper expander
 with st.expander("ℹ️ Regex & wildcard tips", expanded=False):
     st.markdown(
         """
-- Comma-separate multiple patterns.  
-- `*` acts as wildcard: e.g. `03.*` will match `03.04`, `03.02`, etc.  
-- To remove literal underscores or numbers you can just type them directly (they get escaped).  
+- Comma-separate multiple patterns to apply.  
+- Use `*` as a wildcard: e.g., `03.*` matches `03.04`, `03.02`, etc.  
+- To remove specific substrings like `L2_`, just include them literally.  
 - Examples:  
-  - `0?.0?` attempts to match variants like `03.04` or `02.03` (note: `?` in regex means optional previous character; use `0\d\.0\d` for digit patterns).  
-  - `L2_` will remove `L2_` from names.  
+  * `0\d\.0\d` to match versions like `03.04` or `02.03` (note: `?` in regex means "optional previous", so for flexible digits prefer `\d` or character classes).  
+  * `L2_` will strip the literal `L2_` from the filename.  
 """
     )
 
@@ -124,19 +125,28 @@ patterns = build_patterns(remove_input)
 
 if uploads:
     start_time = time.time()
-    # Step 1: read each file with progress
+
+    # ── STEP 1: read source PDFs with progress ─────────────────────────────────
     st.subheader("Reading source PDFs")
     read_bar = st.progress(0)
     all_bytes = []
+    per_file_stats = []
     for i, f in enumerate(uploads):
+        file_start = time.time()
         with st.spinner(f"Reading {f.name} ({i+1}/{len(uploads)})"):
             b = f.read()
             all_bytes.append(b)
+        file_elapsed = time.time() - file_start
+        per_file_stats.append({
+            "Source PDF": f.name,
+            "Pages": len(PdfReader(io.BytesIO(b)).pages) if b else 0,
+            "Read Time": f"{int(file_elapsed//60)}:{int(file_elapsed%60):02d}",
+        })
         pct = int(((i + 1) / len(uploads)) * 100)
         read_bar.progress(pct)
     read_bar.text("Done reading files.")
 
-    # Step 2: build master ZIP with progress
+    # ── STEP 2: build master ZIP with progress ─────────────────────────────────
     st.subheader("Assembling ZIP of splits")
     zip_bar = st.progress(0)
     master = io.BytesIO()
@@ -158,7 +168,7 @@ if uploads:
         mime="application/zip",
     )
 
-    # Step 3: live preview with progress
+    # ── STEP 3: preview with progress ─────────────────────────────────────────
     st.subheader("Filename & Page-Range Preview")
     preview_bar = st.progress(0)
     rows = []
@@ -169,14 +179,18 @@ if uploads:
         splits = split_ranges(entries, total_pages)
 
         for title, start, end in splits:
-            name = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id_prefix else title
+            # Form Name keeps original title (with ID) always
+            form_name_display = title
+
+            # Derive filename base separately, applying remove-id flag only for filenames
+            base_for_filename = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id_prefix else title
             for rx in patterns:
-                name = re.sub(rx, '', name, flags=re.IGNORECASE)
-            fname = slugify(name)
+                base_for_filename = re.sub(rx, '', base_for_filename, flags=re.IGNORECASE)
+            fname = slugify(base_for_filename)
 
             rows.append({
                 "Source PDF": uploads[idx].name,
-                "Form Name": title,
+                "Form Name": form_name_display,
                 "Pages": f"{start}-{end}",
                 "Filename": f"{prefix}{fname}{suffix}.pdf",
             })
@@ -185,18 +199,28 @@ if uploads:
     preview_bar.text("Preview built.")
 
     df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True)
 
-    # Optional summary (you had wanted counts before)
+    # Summary section (counts + time)
     total_forms = len(rows)
-    total_pages = sum(
-        int(r["Pages"].split("-")[1]) - int(r["Pages"].split("-")[0]) + 1
-        for r in rows
-        if "-" in r["Pages"]
-    )
+    total_pages = 0
+    for r in rows:
+        if "-" in r["Pages"]:
+            a, b = r["Pages"].split("-")
+            try:
+                total_pages += int(b) - int(a) + 1
+            except ValueError:
+                pass
     elapsed = time.time() - start_time
     mins = int(elapsed // 60)
     secs = int(elapsed % 60)
     st.markdown(
-        f"**Summary:** {len(uploads)} source PDF(s), ~{total_pages} pages covered, {total_forms} forms extracted. Initial read+prep time: {mins}:{secs:02d}."
+        f"**Summary:** {len(uploads)} source PDF(s), ~{total_pages} pages covered, {total_forms} forms extracted. Initial read+preview time: {mins}:{secs:02d}."
     )
+
+    # Per-file read stats
+    st.subheader("Per-file read stats")
+    stats_df = pd.DataFrame(per_file_stats)
+    st.table(stats_df)
+
+    # Show preview dataframe
+    st.dataframe(df, use_container_width=True)
