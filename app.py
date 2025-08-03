@@ -1,6 +1,7 @@
 import re
 import io
 import zipfile
+
 import streamlit as st
 import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
@@ -11,24 +12,23 @@ st.set_page_config(
     layout="wide",
 )
 
-# ─── HELPERS / CACHING ─────────────────────────────────────────────────────────
+# ─── PDF SPLITTING LOGIC ──────────────────────────────────────────────────────
 
-@st.cache_data(show_spinner=False)
-def detect_toc_pages(reader_texts):
-    """
-    reader_texts: list of page text strings already extracted to avoid
-    re-extracting inside this cached function.
-    """
+def detect_toc_pages(reader):
     entry_rx = re.compile(r'^#\s*\d+:', re.MULTILINE)
-    return [i + 1 for i, txt in enumerate(reader_texts) if entry_rx.search(txt or "")]
+    return [
+        i + 1
+        for i, p in enumerate(reader.pages)
+        if entry_rx.search(p.extract_text() or "")
+    ]
 
 
-@st.cache_data(show_spinner=False)
-def parse_toc_from_texts(reader_texts, toc_pages):
+def parse_toc(reader, toc_pages):
+    # Match: #1234: Title ....... 56
     toc_rx = re.compile(r'#\s*\d+:\s*(.+?)\s*\.{3,}\s*(\d+)', re.MULTILINE)
     entries = []
     for pg in toc_pages:
-        txt = reader_texts[pg - 1] or ""
+        txt = reader.pages[pg - 1].extract_text() or ""
         for m in toc_rx.finditer(txt):
             title = m.group(1).strip()
             start = int(m.group(2))
@@ -52,95 +52,88 @@ def slugify(name):
 
 def build_patterns(raw_input):
     """
-    Turn comma-separated tokens into regex patterns supporting * and ? wildcards.
-    '*' => '.*', '?' => '.'
+    Turn comma-separated tokens into regex patterns, allowing '*' as wildcard.
     """
     pats = []
     for tok in [t.strip() for t in raw_input.split(',') if t.strip()]:
-        # escape everything first
         esc = re.escape(tok)
-        # replace wildcard tokens
-        esc = esc.replace(r'\*', '.*').replace(r'\?', '.')
+        # treat '*' as wildcard
+        esc = esc.replace(r'\*', '.*')
         pats.append(esc)
     return pats
 
 
-def compile_patterns(raw_input):
-    raw_pats = build_patterns(raw_input)
-    return [re.compile(p, re.IGNORECASE) for p in raw_pats]
+def extract_location_category(reader, start_page, max_pages=6):
+    """
+    Starting at the form's first page, scan forward up to max_pages
+    to locate 'Location' and 'Category' fields in the detail section.
+    Returns (location, category), empty string if not found.
+    """
+    loc = ""
+    cat = ""
+    for i in range(start_page - 1, min(len(reader.pages), start_page - 1 + max_pages)):
+        text = reader.pages[i].extract_text() or ""
+        if not cat:
+            mcat = re.search(r'Category\s+([^\n\r]+)', text)
+            if mcat:
+                cat = mcat.group(1).strip()
+        if not loc:
+            mloc = re.search(r'Location\s+([^\n\r]+)', text)
+            if mloc:
+                loc = mloc.group(1).strip()
+        if loc and cat:
+            break
+    return loc, cat
 
 
-@st.cache_data(show_spinner=False)
-def extract_all_page_texts(pdf_bytes):
+def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id_prefix):
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    texts = []
-    for p in reader.pages:
-        try:
-            texts.append(p.extract_text() or "")
-        except Exception:
-            texts.append("")
-    return texts, len(reader.pages)
-
-
-def build_preview_rows(all_bytes, uploads, remove_id_prefix, prefix, suffix, compiled_patterns):
-    rows = []
-    for idx, b in enumerate(all_bytes):
-        source_name = uploads[idx].name
-        reader_texts, total_pages = extract_all_page_texts(b)
-        toc_pages = detect_toc_pages(reader_texts)
-        entries = parse_toc_from_texts(reader_texts, toc_pages)
-        splits = split_ranges(entries, total_pages)
-
-        for title, start, end in splits:
-            # Title shown keeps the original (with maybe the ID)
-            display_title = title
-            # Filename base: strip ID only if requested
-            base_for_filename = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id_prefix else title
-            fname = slugify(base_for_filename)
-            # apply removal patterns on slugified name
-            for pat in compiled_patterns:
-                fname = pat.sub('', fname)
-            final_name = f"{prefix}{fname}{suffix}.pdf"
-
-            rows.append({
-                "Source PDF": source_name,
-                "Form Name": display_title,
-                "Pages": f"{start}-{end}",
-                "Filename": final_name
-            })
-    return rows
-
-
-def create_zip(pdf_bytes, compiled_patterns, prefix, suffix, remove_id):
-    reader_texts, total_pages = extract_all_page_texts(pdf_bytes)
-    toc_pages = detect_toc_pages(reader_texts)
-    entries = parse_toc_from_texts(reader_texts, toc_pages)
-    splits = split_ranges(entries, total_pages)
+    total = len(reader.pages)
+    toc_pages = detect_toc_pages(reader)
+    entries = parse_toc(reader, toc_pages)
+    splits = split_ranges(entries, total)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as zf:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
         for title, start, end in splits:
-            # Filename base (strip ID if requested)
-            base_for_filename = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id else title
-            fname = slugify(base_for_filename)
-            for pat in compiled_patterns:
-                fname = pat.sub('', fname)
-            final_name = f"{prefix}{fname}{suffix}.pdf"
+            # form name shown retains ID; filename optionally removes it
+            name_for_filename = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id_prefix else title
+
+            # apply removal patterns
+            for rx in patterns:
+                name_for_filename = re.sub(rx, '', name_for_filename, flags=re.IGNORECASE)
+
+            fname = slugify(name_for_filename)
+
+            # extract location/category to build folder path
+            loc, cat = extract_location_category(reader, start)
+            folder_parts = []
+            if loc:
+                folder_parts.append(slugify(loc))
+            if cat:
+                folder_parts.append(slugify(cat))
+            folder_path = "/".join(folder_parts)  # e.g., BESS_Yard/Feeder_12B/Electrical/BESS_Assembly
 
             writer = PdfWriter()
-            # be defensive about bounds
-            for p in range(max(0, start - 1), min(end, len(reader.pages))):
-                try:
+            for p in range(start - 1, end):
+                # guard against out-of-range just in case
+                if p < len(reader.pages):
                     writer.add_page(reader.pages[p])
-                except Exception:
-                    continue
             part = io.BytesIO()
             writer.write(part)
             part.seek(0)
-            zf.writestr(final_name, part.read())
+
+            zip_name = f"{prefix}{fname}{suffix}.pdf"
+            if folder_path:
+                archive_name = f"{folder_path}/{zip_name}"
+            else:
+                archive_name = zip_name
+
+            zf.writestr(archive_name, part.read())
+
     buf.seek(0)
     return buf
+
 
 # ─── STREAMLIT UI ────────────────────────────────────────────────────────────
 
@@ -151,60 +144,42 @@ uploads = st.file_uploader(
     type="pdf",
     accept_multiple_files=True,
 )
-
 remove_input = st.text_input("Remove patterns (* wildcards or regex)", "")
 prefix = st.text_input("Filename prefix", "")
 suffix = st.text_input("Filename suffix", "")
 remove_id_prefix = st.checkbox(
-    "Remove numeric ID prefix (e.g. ‘#6849: ’) from filenames",
-    value=True
+    "Remove numeric ID prefix (e.g. ‘#6849: ’) from filenames", value=True
 )
+patterns = build_patterns(remove_input)
 
-# compile regexes once
-compiled_patterns = compile_patterns(remove_input)
-
-# regex helper expander
+# Regex helper
 with st.expander("🛈 Regex & wildcard tips", expanded=False):
     st.markdown(
         """
-- `*` matches any sequence of characters. Example: `03.*` removes `03.04`, `03.02`, etc.
-- `?` matches any single character. Example: `0?.0?` matches `03.04`, `02.03`, etc.
-- Separate multiple patterns with commas: `03.*,_L2_` will remove both parts.
-- Patterns are applied after slugification, so spaces become `_`. For example, to remove `03.04` from `03.04_Exhibit`, you might use `03\.04_` or `03.*_` depending on desired fuzziness.
+- Comma-separate multiple patterns.  
+- Use `*` as a wildcard (e.g., `03.*` matches `03.04`, `03.02`, etc.).  
+- Patterns are treated case-insensitively.  
+- Examples:  
+  * `03.*` removes the section numbers like `03.04`.  
+  * `L2_` removes literal `L2_`.  
+  * `0?.0?` is **not** a wildcard in regex; use `0.` to match `03.` or `02.` or use `0\d\.\d` for precise digit matching.  
+- If you want to match any two-digit dot-two-digit like `03.04` or `02.03`, use `\d{2}\.\d{2}`.  
 """
     )
 
 if uploads:
-    # read bytes once
+    # read all uploaded files
     all_bytes = [f.read() for f in uploads]
 
-    # Preview generation with progress
-    with st.spinner("Parsing uploaded PDFs and building preview..."):
-        progress = st.progress(0)
-        rows = []
-        total = len(all_bytes)
-        for i in range(total):
-            # update progress
-            progress.progress((i + 1) / total)
-        # build all rows (this uses cached helpers internally)
-        rows = build_preview_rows(all_bytes, uploads, remove_id_prefix, prefix, suffix, compiled_patterns)
-        progress.empty()
-
-    df = pd.DataFrame(rows)
-
-    st.subheader("Filename & Page-Range Preview")
-    st.dataframe(df, use_container_width=True)
-
-    # Build combined ZIP
-    with st.spinner("Building ZIP of splits..."):
-        master = io.BytesIO()
-        with zipfile.ZipFile(master, 'w') as mz:
-            for b in all_bytes:
-                subzip = create_zip(b, compiled_patterns, prefix, suffix, remove_id_prefix)
-                with zipfile.ZipFile(subzip) as sz:
-                    for info in sz.infolist():
-                        mz.writestr(info.filename, sz.read(info.filename))
-        master.seek(0)
+    # build master ZIP
+    master = io.BytesIO()
+    with zipfile.ZipFile(master, 'w') as mz:
+        for b, file in zip(all_bytes, uploads):
+            sub = create_zip(b, patterns, prefix, suffix, remove_id_prefix)
+            with zipfile.ZipFile(sub) as sz:
+                for info in sz.infolist():
+                    mz.writestr(info.filename, sz.read(info.filename))
+    master.seek(0)
 
     st.download_button(
         "Download all splits",
@@ -212,3 +187,43 @@ if uploads:
         file_name="acc_build_forms.zip",
         mime="application/zip"
     )
+
+    # live preview
+    st.subheader("Filename & Page-Range Preview")
+    rows = []
+    for idx, b in enumerate(all_bytes):
+        reader = PdfReader(io.BytesIO(b))
+        total_pages = len(reader.pages)
+        entries = parse_toc(reader, detect_toc_pages(reader))
+        splits = split_ranges(entries, total_pages)
+
+        for title, start, end in splits:
+            # maintain form name (with ID for display)
+            form_name = title
+            name_for_filename = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id_prefix else title
+            for rx in patterns:
+                name_for_filename = re.sub(rx, '', name_for_filename, flags=re.IGNORECASE)
+            fname = slugify(name_for_filename)
+
+            # extract location/category
+            loc, cat = extract_location_category(reader, start)
+            folder_parts = []
+            if loc:
+                folder_parts.append(slugify(loc))
+            if cat:
+                folder_parts.append(slugify(cat))
+            folder_path = "/".join(folder_parts)
+
+            display_path = f"{folder_path}/{prefix}{fname}{suffix}.pdf" if folder_path else f"{prefix}{fname}{suffix}.pdf"
+
+            rows.append({
+                "Source PDF": uploads[idx].name,
+                "Form Name": form_name,
+                "Location": loc,
+                "Category": cat,
+                "Pages": f"{start}-{end}",
+                "Foldered Filename": display_path,
+            })
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True)
