@@ -1,6 +1,7 @@
 import re
 import io
 import zipfile
+import time
 
 import streamlit as st
 import pandas as pd
@@ -17,7 +18,7 @@ st.set_page_config(
 def detect_toc_pages(reader):
     entry_rx = re.compile(r'^#\s*\d+:', re.MULTILINE)
     return [
-        i+1
+        i + 1
         for i, p in enumerate(reader.pages)
         if entry_rx.search(p.extract_text() or "")
     ]
@@ -26,7 +27,7 @@ def parse_toc(reader, toc_pages):
     toc_rx = re.compile(r'#\s*\d+:\s*(.+?)\s*\.{3,}\s*(\d+)', re.MULTILINE)
     entries = []
     for pg in toc_pages:
-        txt = reader.pages[pg-1].extract_text() or ""
+        txt = reader.pages[pg - 1].extract_text() or ""
         for m in toc_rx.finditer(txt):
             title = m.group(1).strip()
             start = int(m.group(2))
@@ -36,7 +37,7 @@ def parse_toc(reader, toc_pages):
 def split_ranges(entries, total_pages):
     out = []
     for i, (title, start) in enumerate(entries):
-        end = entries[i+1][1] - 1 if i+1 < len(entries) else total_pages
+        end = entries[i + 1][1] - 1 if i + 1 < len(entries) else total_pages
         out.append((title, start, end))
     return out
 
@@ -52,19 +53,17 @@ def build_patterns(raw_input):
     """
     pats = []
     for tok in [t.strip() for t in raw_input.split(',') if t.strip()]:
-        # escape everything first
         esc = re.escape(tok)
-        # if user included *, treat those as wildcards
-        esc = esc.replace(r'\*', '.*')
+        esc = esc.replace(r'\*', '.*')  # wildcard support
         pats.append(esc)
     return pats
 
 def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
-    reader     = PdfReader(io.BytesIO(pdf_bytes))
-    total      = len(reader.pages)
-    toc_pages  = detect_toc_pages(reader)
-    entries    = parse_toc(reader, toc_pages)
-    splits     = split_ranges(entries, total)
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    total = len(reader.pages)
+    toc_pages = detect_toc_pages(reader)
+    entries = parse_toc(reader, toc_pages)
+    splits = split_ranges(entries, total)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as zf:
@@ -78,8 +77,12 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
 
             fname = slugify(name)
             writer = PdfWriter()
-            for p in range(start-1, end):
-                writer.add_page(reader.pages[p])
+            # guard against bad ranges
+            if start - 1 < 0:
+                continue
+            for p in range(start - 1, end):
+                if p < len(reader.pages):
+                    writer.add_page(reader.pages[p])
             part = io.BytesIO()
             writer.write(part)
             part.seek(0)
@@ -93,49 +96,77 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id):
 
 st.title("ACC Build TOC Splitter")
 
-uploads          = st.file_uploader(
+uploads = st.file_uploader(
     "Upload ACC Build PDF(s)",
     type="pdf",
     accept_multiple_files=True,
 )
-remove_input     = st.text_input("Remove patterns (* wildcards or regex)", "")
-prefix           = st.text_input("Filename prefix", "")
-suffix           = st.text_input("Filename suffix", "")
+remove_input = st.text_input("Remove patterns (* wildcards or regex)", "")
+prefix = st.text_input("Filename prefix", "")
+suffix = st.text_input("Filename suffix", "")
 remove_id_prefix = st.checkbox(
-    "Remove numeric ID prefix (e.g. ‘#6849: ’)",
-    value=True
+    "Remove numeric ID prefix (e.g. ‘#6849: ’)", value=True
 )
+# optional helper expansion
+with st.expander("ℹ️ Regex & wildcard tips", expanded=False):
+    st.markdown(
+        """
+- Comma-separate multiple patterns.  
+- `*` acts as wildcard: e.g. `03.*` will match `03.04`, `03.02`, etc.  
+- To remove literal underscores or numbers you can just type them directly (they get escaped).  
+- Examples:  
+  - `0?.0?` attempts to match variants like `03.04` or `02.03` (note: `?` in regex means optional previous character; use `0\d\.0\d` for digit patterns).  
+  - `L2_` will remove `L2_` from names.  
+"""
+    )
+
 patterns = build_patterns(remove_input)
 
 if uploads:
-    # read all once
-    all_bytes = [f.read() for f in uploads]
+    start_time = time.time()
+    # Step 1: read each file with progress
+    st.subheader("Reading source PDFs")
+    read_bar = st.progress(0)
+    all_bytes = []
+    for i, f in enumerate(uploads):
+        with st.spinner(f"Reading {f.name} ({i+1}/{len(uploads)})"):
+            b = f.read()
+            all_bytes.append(b)
+        pct = int(((i + 1) / len(uploads)) * 100)
+        read_bar.progress(pct)
+    read_bar.text("Done reading files.")
 
-    # build master ZIP
+    # Step 2: build master ZIP with progress
+    st.subheader("Assembling ZIP of splits")
+    zip_bar = st.progress(0)
     master = io.BytesIO()
     with zipfile.ZipFile(master, 'w') as mz:
-        for b, file in zip(all_bytes, uploads):
+        for i, (b, file_obj) in enumerate(zip(all_bytes, uploads)):
             sub = create_zip(b, patterns, prefix, suffix, remove_id_prefix)
             with zipfile.ZipFile(sub) as sz:
                 for info in sz.infolist():
                     mz.writestr(info.filename, sz.read(info.filename))
+            pct = int(((i + 1) / len(all_bytes)) * 100)
+            zip_bar.progress(pct)
     master.seek(0)
+    zip_bar.text("ZIP ready.")
 
     st.download_button(
         "Download all splits",
         master,
         file_name="acc_build_forms.zip",
-        mime="application/zip"
+        mime="application/zip",
     )
 
-    # live preview
+    # Step 3: live preview with progress
     st.subheader("Filename & Page-Range Preview")
+    preview_bar = st.progress(0)
     rows = []
     for idx, b in enumerate(all_bytes):
-        reader      = PdfReader(io.BytesIO(b))
+        reader = PdfReader(io.BytesIO(b))
         total_pages = len(reader.pages)
-        entries     = parse_toc(reader, detect_toc_pages(reader))
-        splits      = split_ranges(entries, total_pages)
+        entries = parse_toc(reader, detect_toc_pages(reader))
+        splits = split_ranges(entries, total_pages)
 
         for title, start, end in splits:
             name = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id_prefix else title
@@ -145,10 +176,27 @@ if uploads:
 
             rows.append({
                 "Source PDF": uploads[idx].name,
-                "Form Name":  title,
-                "Pages":      f"{start}-{end}",
-                "Filename":   f"{prefix}{fname}{suffix}.pdf"
+                "Form Name": title,
+                "Pages": f"{start}-{end}",
+                "Filename": f"{prefix}{fname}{suffix}.pdf",
             })
+        pct = int(((idx + 1) / len(all_bytes)) * 100)
+        preview_bar.progress(pct)
+    preview_bar.text("Preview built.")
 
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True)
+
+    # Optional summary (you had wanted counts before)
+    total_forms = len(rows)
+    total_pages = sum(
+        int(r["Pages"].split("-")[1]) - int(r["Pages"].split("-")[0]) + 1
+        for r in rows
+        if "-" in r["Pages"]
+    )
+    elapsed = time.time() - start_time
+    mins = int(elapsed // 60)
+    secs = int(elapsed % 60)
+    st.markdown(
+        f"**Summary:** {len(uploads)} source PDF(s), ~{total_pages} pages covered, {total_forms} forms extracted. Initial read+prep time: {mins}:{secs:02d}."
+    )
