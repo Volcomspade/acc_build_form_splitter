@@ -61,11 +61,8 @@ def build_patterns(raw_input):
     """
     pats = []
     for tok in [t.strip() for t in raw_input.split(',') if t.strip()]:
-        # escape everything except wildcard syntax
-        # Replace '*' and '?' with placeholders so we can escape remainder
         placeholder = tok.replace('*', '__STAR__').replace('?', '__QMARK__')
         esc = re.escape(placeholder)
-        # restore wildcard semantics
         esc = esc.replace('__STAR__', '.*').replace('__QMARK__', '.')
         pats.append(esc)
     return pats
@@ -97,30 +94,25 @@ def extract_folder_metadata(reader, start, end):
     Fallback to whichever is found; if none, return "Unknown".
     """
     search_text = ""
-    # look up to first few pages of the split to find the block quickly
+    # scan first few pages of the split to find the block quickly
     for pg in range(start - 1, min(start - 1 + 5, end)):
         search_text += (reader.pages[pg].extract_text() or "") + "\n"
         if "References and Attachments" in search_text:
             break
     else:
-        # if not found in first few, scan entire split
         for pg in range(start - 1, end):
             search_text += (reader.pages[pg].extract_text() or "") + "\n"
             if "References and Attachments" in search_text:
                 break
 
-    # Narrow to around the section if possible
     if "References and Attachments" in search_text:
-        # take from that heading onward a bit
         idx = search_text.index("References and Attachments")
-        snippet = search_text[idx : idx + 1000]  # heuristic window
+        snippet = search_text[idx : idx + 1000]
     else:
         snippet = search_text[:1000]
 
-    # Try to extract Category and Location
     loc = None
     cat = None
-    # Patterns like "Category\s*[:]? (.+)" and "Location\s*[:]? (.+)"
     m_cat = re.search(r'Category\s*[:]?[\s]*([^\n\r]+)', snippet, re.IGNORECASE)
     m_loc = re.search(r'Location\s*[:]?[\s]*([^\n\r]+)', snippet, re.IGNORECASE)
 
@@ -150,24 +142,18 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id_prefix):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         for title, start, end in splits:
-            # Always keep the ID in the display title; remove from filename if requested
             filename_title = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id_prefix else title
-
-            # Apply removal patterns on the filename title
             name_for_filename = filename_title
             for rx in patterns:
                 name_for_filename = re.sub(rx, "", name_for_filename, flags=re.IGNORECASE)
-
             fname = slugify(name_for_filename)
             zip_fname = f"{prefix}{fname}{suffix}.pdf"
 
-            # determine folder hierarchy per form from its pages
             folder_hierarchy = extract_folder_metadata(reader, start, end)
             folder_path = make_folder_path(folder_hierarchy)
 
             writer = PdfWriter()
             for p in range(start - 1, end):
-                # guard against out-of-range
                 if 0 <= p < len(reader.pages):
                     writer.add_page(reader.pages[p])
             part = io.BytesIO()
@@ -218,20 +204,25 @@ if uploads:
     all_bytes = [f.read() for f in uploads]
 
     # Build preview with progress
-    st.subheader("Filename & Page-Range Preview")
+    st.subheader("Summary")
+    total_forms = 0
+    total_split_pages = 0
+    original_pdf_pages = 0
+    preview_rows = []
     progress = st.progress(0)
-    rows = []
-    total_files = len(all_bytes)
     for idx, b in enumerate(all_bytes):
         reader = PdfReader(io.BytesIO(b))
         total_pages = len(reader.pages)
+        original_pdf_pages += total_pages
+
         entries = parse_toc(reader, detect_toc_pages(reader))
         splits = split_ranges(entries, total_pages)
 
         for title, start, end in splits:
-            # Form name always shows original title (with ID)
+            total_forms += 1
+            total_split_pages += (end - start + 1)
+
             form_name = title
-            # Build filename respecting remove_id_prefix
             filename_title = re.sub(r'^#\s*\d+:\s*', '', title) if remove_id_prefix else title
             patterns = build_patterns(remove_input)
             name_for_filename = filename_title
@@ -239,10 +230,9 @@ if uploads:
                 name_for_filename = re.sub(rx, "", name_for_filename, flags=re.IGNORECASE)
             fname = slugify(name_for_filename)
             zip_fname = f"{prefix}{fname}{suffix}.pdf"
-
             folder_hierarchy = extract_folder_metadata(reader, start, end)
-            # show the human-readable with '>' in preview
-            rows.append(
+
+            preview_rows.append(
                 {
                     "Source PDF": uploads[idx].name,
                     "Form Name": form_name,
@@ -251,8 +241,17 @@ if uploads:
                     "Filename": zip_fname,
                 }
             )
-        progress.progress((idx + 1) / total_files)
-    df = pd.DataFrame(rows)
+
+        progress.progress((idx + 1) / len(all_bytes))
+
+    # Summary metrics
+    c1, c2, c3 = st.columns([1, 1, 1])
+    c1.metric("Total forms", total_forms)
+    c2.metric("Total split pages", total_split_pages)
+    c3.metric("Original PDF pages", original_pdf_pages)
+
+    st.subheader("Filename & Page-Range Preview")
+    df = pd.DataFrame(preview_rows)
     st.dataframe(df, use_container_width=True)
 
     # build combined ZIP
