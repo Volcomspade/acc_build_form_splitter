@@ -16,33 +16,46 @@ st.set_page_config(
 # ─── METADATA EXTRACTION ────────────────────────────────────────────────────────
 def extract_meta(doc: fitz.Document):
     """
-    Returns (template, category, location)
-     - template: from the "#1234: … : <template>" line on page 0
-     - category, location: from the "References and Attachments" block on pages 1–4
+    Returns (template, category, location):
+      - template: from the "Template: ..." line under the Forms section on page 0,
+                  else from the "#1234: ... : <template>" TOC title on page 0.
+      - category, location: from "Category:" & "Location:" in References & Attachments on pages 1–4.
     """
-    # 1) TEMPLATE (page 0)
     template = "Unknown"
+
+    # ── 1) Page 0: find the Forms → Template: line
     for line in doc.load_page(0).get_text().splitlines():
-        if line.startswith("#") and line.count(":") >= 2:
-            # "#7893: XYZ: 03.04 Some Template Name"
-            template = line.split(":", 2)[2].strip()
+        if line.startswith("Template"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                template = parts[1].strip()
             break
 
-    # 2) CATEGORY & LOCATION (pages 1–4)
+    # ── 2) Fallback: extract from the TOC title "#1234: ... : <template>"
+    if template == "Unknown":
+        for line in doc.load_page(0).get_text().splitlines():
+            if line.startswith("#") and line.count(":") >= 2:
+                # split into three parts max, take the third
+                template = line.split(":", 2)[2].strip()
+                break
+
+    # ── 3) Pages 1–4: find Category & Location
     category = location = "Unknown"
     for p in range(1, min(doc.page_count, 5)):
         for line in doc.load_page(p).get_text().splitlines():
             if line.startswith("Category"):
-                # either "Category: Foo" or "Category    Foo"
                 parts = line.split(":", 1)
-                category = parts[1].strip() if len(parts) == 2 else line[len("Category"):].strip()
+                if len(parts) == 2:
+                    category = parts[1].strip()
             elif line.startswith("Location"):
                 parts = line.split(":", 1)
-                location = parts[1].strip() if len(parts) == 2 else line[len("Location"):].strip()
+                if len(parts) == 2:
+                    location = parts[1].strip()
         if category != "Unknown" and location != "Unknown":
             break
 
     return template, category, location
+
 
 # ─── TOC PARSING ───────────────────────────────────────────────────────────────
 def detect_toc_pages(doc: fitz.Document):
