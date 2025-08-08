@@ -17,34 +17,33 @@ st.set_page_config(
 def extract_meta(doc: fitz.Document):
     """
     Returns (template, category, location).
-    - template: from page 0's "Template: ..." line
-    - category, location: from the References & Attachments table on pages 1+
+    - template: from page 0’s “Template” line (with or without colon)
+    - category, location: from the “References & Attachments” section (pages 1+)
     """
-    # ─ Template on page 0 ─────────────────
+    # compile once
+    template_rx = re.compile(r"^Template\s*[:\-]?\s*(.+)", re.IGNORECASE)
+    cat_rx      = re.compile(r"^Category\s*[:\-]?\s*(.+)", re.IGNORECASE)
+    loc_rx      = re.compile(r"^Location\s*[:\-]?\s*(.+)", re.IGNORECASE)
+
+    # ─ Template on page 0 ────────────────────────────────────────
     template = "Unknown"
     for line in doc.load_page(0).get_text().splitlines():
-        l = line.strip()
-        if l.lower().startswith("template"):
-            parts = l.split(":", 1)
-            if len(parts) == 2:
-                template = parts[1].strip()
+        m = template_rx.match(line.strip())
+        if m:
+            template = m.group(1).strip()
             break
 
-    # ─ Category & Location on pages 1+ ────
+    # ─ Category & Location on pages 1+ ───────────────────────────
     category = location = "Unknown"
-    # regex patterns to catch "Category:" or "Location:"
-    cat_rx = re.compile(r"Category\s*[:]\s*(.+)", re.IGNORECASE)
-    loc_rx = re.compile(r"Location\s*[:]\s*(.+)", re.IGNORECASE)
-
     for i in range(1, doc.page_count):
         for line in doc.load_page(i).get_text().splitlines():
-            l = line.strip()
-            m_cat = cat_rx.search(l)
-            if m_cat:
-                category = m_cat.group(1).strip()
-            m_loc = loc_rx.search(l)
-            if m_loc:
-                location = m_loc.group(1).strip()
+            text = line.strip()
+            m1 = cat_rx.match(text)
+            if m1:
+                category = m1.group(1).strip()
+            m2 = loc_rx.match(text)
+            if m2:
+                location = m2.group(1).strip()
         if category != "Unknown" and location != "Unknown":
             break
 
@@ -53,19 +52,18 @@ def extract_meta(doc: fitz.Document):
 # ─── TOC PARSING ───────────────────────────────────────────────────────────────
 def detect_toc_pages(doc: fitz.Document):
     entry_rx = re.compile(r"^#\s*\d+:", re.MULTILINE)
-    pages = []
-    for i in range(doc.page_count):
-        if entry_rx.search(doc.load_page(i).get_text()):
-            pages.append(i + 1)
-    return pages
+    return [
+        i+1
+        for i in range(doc.page_count)
+        if entry_rx.search(doc.load_page(i).get_text())
+    ]
 
 def parse_toc(doc: fitz.Document, toc_pages: list[int]):
-    # keep the full "#1234: Title…" in group(1)
     toc_rx = re.compile(r"(#\s*\d+:\s*.+?)\.{3,}\s*(\d+)", re.MULTILINE)
     entries = []
     for pg in toc_pages:
-        text = doc.load_page(pg - 1).get_text() or ""
-        for m in toc_rx.finditer(text):
+        txt = doc.load_page(pg-1).get_text() or ""
+        for m in toc_rx.finditer(txt):
             entries.append((m.group(1).strip(), int(m.group(2))))
     return entries
 
@@ -85,8 +83,7 @@ def slugify(name: str) -> str:
 def build_patterns(raw: str):
     pats = []
     for tok in [t.strip() for t in raw.split(",") if t.strip()]:
-        esc = re.escape(tok)
-        esc = esc.replace(r"\*", ".*?")  # non-greedy wildcard
+        esc = re.escape(tok).replace(r"\*", ".*?")
         pats.append(esc)
     return pats
 
@@ -100,18 +97,18 @@ def create_subzip(
     group_by: str,
 ):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    total_pages = doc.page_count
+    total = doc.page_count
 
     toc_pages = detect_toc_pages(doc)
     entries   = parse_toc(doc, toc_pages)
-    splits    = split_ranges(entries, total_pages)
+    splits    = split_ranges(entries, total)
 
     tpl, cat, loc = extract_meta(doc)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         for title, start, end in splits:
-            # choose folder path
+            # pick folder
             if group_by == "Location/Category":
                 folder = f"{loc}/{cat}/"
             elif group_by == "Template":
@@ -119,24 +116,23 @@ def create_subzip(
             else:
                 folder = ""
 
-            # build base filename
+            # build filename
             base = title
             if remove_id:
                 base = re.sub(r"^#\s*\d+:\s*", "", base)
             for rx in patterns:
                 base = re.sub(rx, "", base, flags=re.IGNORECASE)
             fname = slugify(base)
-
             out_name = f"{folder}{prefix}{fname}{suffix}.pdf"
 
-            # extract pages
-            new_doc = fitz.open()
+            # pull pages
+            newd = fitz.open()
             for p in range(start-1, end):
-                new_doc.insert_pdf(doc, from_page=p, to_page=p)
-            part_bytes = new_doc.write()
-            new_doc.close()
+                newd.insert_pdf(doc, from_page=p, to_page=p)
+            data = newd.write()
+            newd.close()
 
-            zf.writestr(out_name, part_bytes)
+            zf.writestr(out_name, data)
 
     buf.seek(0)
     return buf, tpl, cat, loc, splits
@@ -165,15 +161,11 @@ group_by = st.selectbox(
 if uploads:
     patterns = build_patterns(remove_input)
 
-    # initial read + timing
     t0 = time.perf_counter()
     all_bytes = [f.read() for f in uploads]
     docs      = [fitz.open(stream=b, filetype="pdf") for b in all_bytes]
     total_pages = sum(d.page_count for d in docs)
-    total_forms = sum(
-        len(parse_toc(d, detect_toc_pages(d)))
-        for d in docs
-    )
+    total_forms = sum(len(parse_toc(d, detect_toc_pages(d))) for d in docs)
     elapsed = time.perf_counter() - t0
     m, s = divmod(int(elapsed), 60)
 
@@ -183,7 +175,6 @@ if uploads:
     c3.metric("Total forms", total_forms)
     c4.metric("Initial read", f"{m:02d}:{s:02d}")
 
-    # build ZIP
     def get_master_zip():
         mz = io.BytesIO()
         with zipfile.ZipFile(mz, "w") as out_z:
@@ -192,9 +183,9 @@ if uploads:
                     b, patterns, prefix, suffix,
                     remove_id_prefix, group_by
                 )
-                with zipfile.ZipFile(subzip) as inz:
-                    for info in inz.infolist():
-                        out_z.writestr(info.filename, inz.read(info.filename))
+                with zipfile.ZipFile(subzip) as in_z:
+                    for info in in_z.infolist():
+                        out_z.writestr(info.filename, in_z.read(info.filename))
         mz.seek(0)
         return mz
 
@@ -205,7 +196,7 @@ if uploads:
         mime="application/zip",
     )
 
-    # live preview
+    # preview
     rows = []
     for idx, doc in enumerate(docs):
         tpl, cat, loc = extract_meta(doc)
