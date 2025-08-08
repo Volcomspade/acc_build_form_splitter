@@ -17,27 +17,40 @@ st.set_page_config(
 def extract_meta(doc: fitz.Document):
     """
     Returns (template, category, location):
-      - template: from the "Template: ..." line under the Forms section on page 0,
-                  else from the "#1234: ... : <template>" TOC title on page 0.
-      - category, location: from "Category:" & "Location:" in References & Attachments on pages 1–4.
+      - template: first tries the "Template: ..." line under the Forms block on page 0;
+                  if not found, falls back to the 3rd ':'-delimited piece of the TOC title.
+      - category, location: regex-extracted anywhere on pages 1–end for "Category:" & "Location:".
     """
+    # ── 1) Template from the Forms section on page 0
     template = "Unknown"
-
-    # ── 1) Page 0: find the Forms → Template: line
-    for line in doc.load_page(0).get_text().splitlines():
-        if line.startswith("Template"):
-            parts = line.split(":", 1)
-            if len(parts) == 2:
-                template = parts[1].strip()
+    page0 = doc.load_page(0).get_text().splitlines()
+    for line in page0:
+        m = re.match(r"\s*Template\s*:\s*(.+)", line)
+        if m:
+            template = m.group(1).strip()
             break
 
-    # ── 2) Fallback: extract from the TOC title "#1234: ... : <template>"
+    # ── 2) Fallback: if still Unknown, grab after the 2nd ':' of a "#1234: ... : <template>" line
     if template == "Unknown":
-        for line in doc.load_page(0).get_text().splitlines():
+        for line in page0:
             if line.startswith("#") and line.count(":") >= 2:
-                # split into three parts max, take the third
                 template = line.split(":", 2)[2].strip()
                 break
+
+    # ── 3) Category & Location via regex on pages 1–end
+    category = location = "Unknown"
+    for i in range(1, doc.page_count):
+        text = doc.load_page(i).get_text()
+        m_cat = re.search(r"Category\s*:\s*(.+)", text)
+        m_loc = re.search(r"Location\s*:\s*(.+)", text)
+        if m_cat:
+            category = m_cat.group(1).strip()
+        if m_loc:
+            location = m_loc.group(1).strip()
+        if category != "Unknown" and location != "Unknown":
+            break
+
+    return template, category, location
 
     # ── 3) Pages 1–4: find Category & Location
     category = location = "Unknown"
