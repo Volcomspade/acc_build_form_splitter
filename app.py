@@ -17,25 +17,58 @@ st.set_page_config(
 def extract_meta(doc: fitz.Document):
     """
     Returns (template, category, location):
-      - template: first tries the "Template: ..." line under the Forms block on page 0;
-                  if not found, falls back to the 3rd ':'-delimited piece of the TOC title.
-      - category, location: regex-extracted anywhere on pages 1–end for "Category:" & "Location:".
+      - template: from the 'Forms' table on page 0 under 'Template:'
+                  (fallback: after the second ':' of the TOC title).
+      - category/location: only from the 'References and Attachments' block.
     """
-    # ── 1) Template from the Forms section on page 0
+    # ── 1) TEMPLATE from page 0 Forms section ────────────────────────────────
     template = "Unknown"
-    page0 = doc.load_page(0).get_text().splitlines()
-    for line in page0:
+    for line in doc.load_page(0).get_text().splitlines():
         m = re.match(r"\s*Template\s*:\s*(.+)", line)
         if m:
             template = m.group(1).strip()
             break
-
-    # ── 2) Fallback: if still Unknown, grab after the 2nd ':' of a "#1234: ... : <template>" line
-    if template == "Unknown":
-        for line in page0:
+    else:
+        # fallback: TOC title like "#1234: ACC/DCC-D6.2 (...): 03.04 Exhibit H-3..."
+        for line in doc.load_page(0).get_text().splitlines():
             if line.startswith("#") and line.count(":") >= 2:
                 template = line.split(":", 2)[2].strip()
                 break
+
+    # ── 2) CATEGORY & LOCATION from References & Attachments ────────────────
+    category = location = "Unknown"
+    for i in range(doc.page_count):
+        lines = doc.load_page(i).get_text().splitlines()
+        # find the section header
+        for idx, ln in enumerate(lines):
+            if "References and Attachments" in ln:
+                # scan the next few lines for Category & Location
+                for sub in lines[idx + 1 : idx + 15]:
+                    m_cat = re.match(r"Category\s*[:\s]\s*(.+)", sub)
+                    m_loc = re.match(r"Location\s*[:\s]\s*(.+)", sub)
+                    if m_cat:
+                        category = m_cat.group(1).strip()
+                    if m_loc:
+                        location = m_loc.group(1).strip()
+                    if category != "Unknown" and location != "Unknown":
+                        return template, category, location
+                # if we saw the header but failed to find both, stop looking further
+                return template, category, location
+
+    # ── 3) last-resort scan (anywhere) ───────────────────────────────────────
+    for i in range(1, doc.page_count):
+        text = doc.load_page(i).get_text()
+        m_cat = re.search(r"Category\s*[:\s]\s*(.+)", text)
+        m_loc = re.search(r"Location\s*[:\s]\s*(.+)", text)
+        if m_cat:
+            category = m_cat.group(1).strip()
+        if m_loc:
+            location = m_loc.group(1).strip()
+        if category != "Unknown" and location != "Unknown":
+            break
+
+    return template, category, location
+
 
     # ── 3) Category & Location via regex on pages 1–end
     category = location = "Unknown"
