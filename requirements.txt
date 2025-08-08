@@ -1,3 +1,4 @@
 streamlit
 pandas
-PyMuPDF==1.23.3
+PyMuPDF
+
