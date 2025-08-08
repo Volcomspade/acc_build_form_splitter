@@ -16,30 +16,31 @@ st.set_page_config(
 # ─── METADATA EXTRACTION ────────────────────────────────────────────────────────
 def extract_meta(doc: fitz.Document):
     """
-    Extracts:
-      - template (from page 0's "Template: ..." line)
-      - category  (from References & Attachments, pages 1+)
-      - location  (same section)
+    Returns (template, category, location).
+    - template: first page line "Template: ..." 
+    - category, location: from "References & Attachments" on pages 1+
     """
+    # --- Template on page 0 ---
     template = "Unknown"
-    # Page 0 → Template:
     for line in doc.load_page(0).get_text().splitlines():
-        if line.startswith("Template"):
-            parts = line.split(":", 1)
+        l = line.strip()
+        if l.startswith("Template"):
+            parts = l.split(":", 1)
             if len(parts) == 2:
                 template = parts[1].strip()
             break
 
+    # --- Category & Location on pages 1+ ---
     category = location = "Unknown"
-    # Pages 1+ → find Category: ... and Location: ...
     for i in range(1, doc.page_count):
         for line in doc.load_page(i).get_text().splitlines():
-            if line.startswith("Category"):
-                parts = line.split(":", 1)
+            l = line.strip()
+            if l.startswith("Category"):
+                parts = l.split(":", 1)
                 if len(parts) == 2:
                     category = parts[1].strip()
-            elif line.startswith("Location"):
-                parts = line.split(":", 1)
+            elif l.startswith("Location"):
+                parts = l.split(":", 1)
                 if len(parts) == 2:
                     location = parts[1].strip()
         if category != "Unknown" and location != "Unknown":
@@ -52,8 +53,7 @@ def detect_toc_pages(doc: fitz.Document):
     entry_rx = re.compile(r"^#\s*\d+:", re.MULTILINE)
     pages = []
     for i in range(doc.page_count):
-        text = doc.load_page(i).get_text()
-        if entry_rx.search(text):
+        if entry_rx.search(doc.load_page(i).get_text()):
             pages.append(i + 1)
     return pages
 
@@ -63,7 +63,9 @@ def parse_toc(doc: fitz.Document, toc_pages: list[int]):
     for pg in toc_pages:
         text = doc.load_page(pg - 1).get_text() or ""
         for m in toc_rx.finditer(text):
-            entries.append((m.group(1).strip(), int(m.group(2))))
+            title = m.group(1).strip()
+            start = int(m.group(2))
+            entries.append((title, start))
     return entries
 
 def split_ranges(entries: list[tuple[str,int]], total: int):
@@ -80,10 +82,13 @@ def slugify(name: str) -> str:
     return re.sub(r"_+", "_", s).strip("_")
 
 def build_patterns(raw: str):
+    """
+    Comma-separated tokens. Escape literal chars, turn '*' into '.*?' for non-greedy.
+    """
     pats = []
     for tok in [t.strip() for t in raw.split(",") if t.strip()]:
         esc = re.escape(tok)
-        esc = esc.replace(r"\*", ".*")
+        esc = esc.replace(r"\*", ".*?")  # non-greedy wildcard
         pats.append(esc)
     return pats
 
@@ -108,7 +113,7 @@ def create_subzip(
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         for title, start, end in splits:
-            # decide folder path
+            # choose folder path
             if group_by == "Location/Category":
                 folder = f"{loc}/{cat}/"
             elif group_by == "Template":
@@ -116,19 +121,17 @@ def create_subzip(
             else:
                 folder = ""
 
-            # form name (display only)
-            form_name = title
-
-            # build raw filename
+            # build base filename (leave title itself untouched)
             base = title
             if remove_id:
                 base = re.sub(r"^#\s*\d+:\s*", "", base)
             for rx in patterns:
                 base = re.sub(rx, "", base, flags=re.IGNORECASE)
             fname = slugify(base)
+
             out_name = f"{folder}{prefix}{fname}{suffix}.pdf"
 
-            # assemble page range
+            # extract pages into a new document
             new_doc = fitz.open()
             for p in range(start-1, end):
                 new_doc.insert_pdf(doc, from_page=p, to_page=p)
@@ -162,10 +165,10 @@ group_by = st.selectbox(
 )
 
 if uploads:
-    # build regex list
+    # compile patterns
     patterns = build_patterns(remove_input)
 
-    # initial read timing
+    # initial read & timing
     t0 = time.perf_counter()
     all_bytes = [f.read() for f in uploads]
     docs      = [fitz.open(stream=b, filetype="pdf") for b in all_bytes]
@@ -178,14 +181,14 @@ if uploads:
     elapsed = time.perf_counter() - t0
     mins, secs = divmod(int(elapsed), 60)
 
-    # summary metrics
+    # summary row
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Source PDFs", len(uploads))
     c2.metric("Total pages", total_pages)
     c3.metric("Total forms", total_forms)
     c4.metric("Initial read", f"{mins:02d}:{secs:02d}")
 
-    # assemble master ZIP on‐demand
+    # build master ZIP
     def get_master_zip():
         mz_buf = io.BytesIO()
         with zipfile.ZipFile(mz_buf, "w") as mz:
@@ -207,15 +210,14 @@ if uploads:
         mime="application/zip",
     )
 
-    # live preview table
-    preview_rows = []
-    for idx, (b, d) in enumerate(zip(all_bytes, docs)):
-        tpl, cat, loc = extract_meta(d)
+    # live preview
+    preview = []
+    for idx, doc in enumerate(docs):
+        tpl, cat, loc = extract_meta(doc)
         splits = split_ranges(
-            parse_toc(d, detect_toc_pages(d)),
-            d.page_count
+            parse_toc(doc, detect_toc_pages(doc)),
+            doc.page_count
         )
-
         for title, start, end in splits:
             if group_by == "Location/Category":
                 folder = f"{loc} / {cat}"
@@ -224,6 +226,7 @@ if uploads:
             else:
                 folder = ""
 
+            # filename logic
             base = title
             if remove_id_prefix:
                 base = re.sub(r"^#\s*\d+:\s*", "", base)
@@ -232,7 +235,7 @@ if uploads:
             fname = slugify(base)
             fn = f"{prefix}{fname}{suffix}.pdf"
 
-            preview_rows.append({
+            preview.append({
                 "Source PDF": uploads[idx].name,
                 "Folder":     folder,
                 "Form Name":  title,
@@ -240,6 +243,5 @@ if uploads:
                 "Filename":   fn,
             })
 
-    df = pd.DataFrame(preview_rows)
     st.subheader("Filename & Page-Range Preview")
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(pd.DataFrame(preview), use_container_width=True)
