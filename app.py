@@ -15,37 +15,35 @@ st.set_page_config(
 
 # ─── METADATA EXTRACTION ────────────────────────────────────────────────────────
 def extract_meta(doc: fitz.Document):
-    """
-    - template: from the blue header on page 0, 3rd colon-delimited field
-    - category & location: from the References & Attachments table pages 1–4,
-      matching lines like 'Category  Electrical > BESS Assembly'
-    """
-    # 1) TEMPLATE from the first header line on page 0
-    page0_lines = doc.load_page(0).get_text().splitlines()
+    # — TEMPLATE from page 0 (#1234: … : <template>)
     template = "Unknown"
-    for line in page0_lines:
-        if line.startswith("#") and ":" in line:
-            parts = line.split(":", 2)  # "#id: prefix: template"
-            if len(parts) == 3:
-                template = parts[2].strip()
+    for line in doc.load_page(0).get_text().splitlines():
+        if line.startswith("#") and line.count(":") >= 2:
+            template = line.split(":", 2)[2].strip()
             break
 
-    # 2) CATEGORY & LOCATION from pages 1–4
+    # — CATEGORY & LOCATION from pages 1–4
     category = location = "Unknown"
-    cat_rx = re.compile(r"Category\s*[:\s]\s*(.+)")
-    loc_rx = re.compile(r"Location\s*[:\s]\s*(.+)")
-    for pnum in range(1, min(doc.page_count, 5)):
-        for line in doc.load_page(pnum).get_text().splitlines():
-            m1 = cat_rx.match(line)
-            if m1:
-                category = m1.group(1).strip()
-            m2 = loc_rx.match(line)
-            if m2:
-                location = m2.group(1).strip()
+    for p in range(1, min(doc.page_count, 5)):
+        for line in doc.load_page(p).get_text().splitlines():
+            if line.startswith("Category"):
+                # either “Category: Value” or “Category    Value”
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    category = parts[1].strip()
+                else:
+                    category = line[len("Category"):].strip()
+            elif line.startswith("Location"):
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    location = parts[1].strip()
+                else:
+                    location = line[len("Location"):].strip()
         if category != "Unknown" and location != "Unknown":
             break
 
     return template, category, location
+
 
 # ─── TOC PARSING ───────────────────────────────────────────────────────────────
 def detect_toc_pages(doc: fitz.Document):
