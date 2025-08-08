@@ -1,0 +1,2 @@
+[server]
+fileWatcherType = "poll"   # or "none" to disable entirely
