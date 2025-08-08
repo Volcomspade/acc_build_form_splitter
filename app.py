@@ -5,7 +5,7 @@ import time
 
 import streamlit as st
 import pandas as pd
-from PyPDF2 import PdfReader, PdfWriter
+import fitz  # PyMuPDF
 
 # ─── STREAMLIT CONFIG ─────────────────────────────────────────────────────────
 st.set_page_config(
@@ -15,20 +15,22 @@ st.set_page_config(
 
 # ─── PDF SPLITTING LOGIC ──────────────────────────────────────────────────────
 
-def detect_toc_pages(reader):
+def detect_toc_pages(doc):
     entry_rx = re.compile(r'^#\s*\d+:', re.MULTILINE)
-    return [
-        i+1
-        for i, p in enumerate(reader.pages)
-        if entry_rx.search(p.extract_text() or "")
-    ]
+    toc_pages = []
+    for i in range(doc.page_count):
+        text = doc.load_page(i).get_text()
+        if entry_rx.search(text):
+            # pages are 1-based in TOC
+            toc_pages.append(i + 1)
+    return toc_pages
 
-def parse_toc(reader, toc_pages):
+def parse_toc(doc, toc_pages):
     toc_rx = re.compile(r'#\s*\d+:\s*(.+?)\s*\.{3,}\s*(\d+)', re.MULTILINE)
     entries = []
     for pg in toc_pages:
-        txt = reader.pages[pg-1].extract_text() or ""
-        for m in toc_rx.finditer(txt):
+        text = doc.load_page(pg-1).get_text()
+        for m in toc_rx.finditer(text):
             title = m.group(1).strip()
             start = int(m.group(2))
             entries.append((title, start))
@@ -46,65 +48,45 @@ def slugify(name):
     s = re.sub(r'\s+', '_', s)
     return re.sub(r'_+', '_', s).strip('_')
 
-def build_patterns(raw_input):
-    """
-    Turn comma-separated tokens into literal-escaped regex patterns,
-    then replace any \* back into non-greedy .*? for wildcards.
-    """
+def build_patterns(raw):
     pats = []
-    for tok in [t.strip() for t in raw_input.split(',') if t.strip()]:
+    for tok in [t.strip() for t in raw.split(',') if t.strip()]:
         esc = re.escape(tok)
-        # non-greedy wildcard
-        esc = esc.replace(r'\*', '.*?')
+        esc = esc.replace(r'\*', '.*?')  # non-greedy wildcard
         pats.append(esc)
     return pats
 
 def extract_template(title):
-    """
-    From a TOC title like:
-      "#6859: ACC/DCC-D6.2 (P...): 03.04 Exhibit H-3 - Exhibit H-4 ACC Build"
-    grab the part after the second colon.
-    """
     parts = title.split(':', 2)
     return parts[2].strip() if len(parts) == 3 else title
 
 def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id, group_by):
-    reader     = PdfReader(io.BytesIO(pdf_bytes))
-    total      = len(reader.pages)
-    toc_pages  = detect_toc_pages(reader)
-    entries    = parse_toc(reader, toc_pages)
-    splits     = split_ranges(entries, total)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total = doc.page_count
+    toc_pages = detect_toc_pages(doc)
+    entries = parse_toc(doc, toc_pages)
+    splits = split_ranges(entries, total)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as zf:
         for title, start, end in splits:
-            # always keep full title for display; strip only for filename
-            raw_name = title
-
-            # filename base: optionally drop "#1234:"
-            name_for_file = re.sub(r'^#\s*\d+:\s*', '', raw_name) if remove_id else raw_name
-            # apply wildcards/regex
+            raw_title = title
+            fn_base = re.sub(r'^#\s*\d+:\s*', '', raw_title) if remove_id else raw_title
             for rx in patterns:
-                name_for_file = re.sub(rx, '', name_for_file, flags=re.IGNORECASE)
-            fname = slugify(name_for_file)
-
-            # choose folder
-            if group_by == "Template":
-                folder = slugify(extract_template(raw_name))
-            else:
-                folder = None
-
-            writer = PdfWriter()
-            for p in range(start-1, end):
-                writer.add_page(reader.pages[p])
-            part = io.BytesIO()
-            writer.write(part)
-            part.seek(0)
-
+                fn_base = re.sub(rx, '', fn_base, flags=re.IGNORECASE)
+            fname = slugify(fn_base)
             arcname = f"{prefix}{fname}{suffix}.pdf"
-            if folder:
+
+            if group_by == "Template":
+                folder = slugify(extract_template(raw_title))
                 arcname = f"{folder}/{arcname}"
-            zf.writestr(arcname, part.read())
+
+            # extract pages via PyMuPDF
+            new_doc = fitz.open()
+            for p in range(start-1, end):
+                new_doc.insert_pdf(doc, from_page=p, to_page=p)
+            part_bytes = new_doc.write()
+            zf.writestr(arcname, part_bytes)
 
     buf.seek(0)
     return buf
@@ -113,32 +95,21 @@ def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id, group_by):
 
 st.title("ACC Build TOC Splitter")
 
-uploads          = st.file_uploader(
-    "Upload ACC Build PDF(s)",
-    type="pdf",
-    accept_multiple_files=True,
-)
+uploads          = st.file_uploader("Upload ACC Build PDF(s)", type="pdf", accept_multiple_files=True)
 remove_input     = st.text_input("Remove patterns (* wildcards or regex)", "")
 prefix           = st.text_input("Filename prefix", "")
 suffix           = st.text_input("Filename suffix", "")
-remove_id_prefix = st.checkbox(
-    "Remove numeric ID prefix (e.g. ‘#6849: ’) from **filenames** only",
-    value=True
-)
-group_by = st.selectbox(
-    "Group files in ZIP by:",
-    ["None", "Template"]
-)
+remove_id_prefix = st.checkbox("Remove numeric ID prefix (e.g. ‘#6849: ’) from **filenames** only", value=True)
+group_by         = st.selectbox("Group files in ZIP by:", ["None", "Template"])
 
 patterns = build_patterns(remove_input)
 
 if uploads:
-    # ─ read & time it ─
     t0 = time.time()
     all_bytes = [f.read() for f in uploads]
     read_time = time.time() - t0
 
-    # ─ build master ZIP ─
+    # build ZIP
     master = io.BytesIO()
     with zipfile.ZipFile(master, 'w') as mz:
         for b in all_bytes:
@@ -148,48 +119,38 @@ if uploads:
                     mz.writestr(info.filename, sz.read(info.filename))
     master.seek(0)
 
-    # ─ stats & download ─
-    st.download_button(
-        "Download all splits",
-        master,
-        file_name="acc_build_forms.zip",
-        mime="application/zip"
-    )
+    st.download_button("Download all splits", master, file_name="acc_build_forms.zip", mime="application/zip")
 
+    # stats
     st.markdown("---")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Source PDFs", len(uploads))
-    col2.metric("Total pages", sum(len(PdfReader(io.BytesIO(b)).pages) for b in all_bytes))
-    # total forms = sum of split counts
-    total_forms = sum(len(split_ranges(parse_toc(PdfReader(io.BytesIO(b)), detect_toc_pages(PdfReader(io.BytesIO(b)))), len(PdfReader(io.BytesIO(b)).pages))) for b in all_bytes)
-    col3.metric("Total forms", total_forms)
-    col4.metric("Initial read", f"{int(read_time//60):02}:{int(read_time%60):02}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Source PDFs", len(uploads))
+    total_pages = sum(fitz.open(stream=b, filetype="pdf").page_count for b in all_bytes)
+    c2.metric("Total pages", total_pages)
+    total_forms = sum(len(split_ranges(parse_toc(fitz.open(stream=b, filetype="pdf"), detect_toc_pages(fitz.open(stream=b, filetype="pdf"))), fitz.open(stream=b, filetype="pdf").page_count)) for b in all_bytes)
+    c3.metric("Total forms", total_forms)
+    c4.metric("Initial read", f"{int(read_time//60):02}:{int(read_time%60):02}")
 
-    # ─ live preview ─
+    # preview
     st.subheader("Filename & Page-Range Preview")
     rows = []
     for idx, b in enumerate(all_bytes):
-        reader      = PdfReader(io.BytesIO(b))
-        total_pages = len(reader.pages)
-        entries     = parse_toc(reader, detect_toc_pages(reader))
-        splits      = split_ranges(entries, total_pages)
-
+        doc = fitz.open(stream=b, filetype="pdf")
+        total = doc.page_count
+        entries = parse_toc(doc, detect_toc_pages(doc))
+        splits = split_ranges(entries, total)
         for title, start, end in splits:
-            raw_name     = title
-            # only strip ID for filename
-            fn_base      = re.sub(r'^#\s*\d+:\s*', '', raw_name) if remove_id_prefix else raw_name
+            raw_title = title
+            fn_base = re.sub(r'^#\s*\d+:\s*', '', raw_title) if remove_id_prefix else raw_title
             for rx in patterns:
-                fn_base  = re.sub(rx, '', fn_base, flags=re.IGNORECASE)
-            fname        = slugify(fn_base)
-            arcname      = f"{prefix}{fname}{suffix}.pdf"
-            if group_by == "Template":
-                folder = slugify(extract_template(raw_name))
-            else:
-                folder = ""
+                fn_base = re.sub(rx, '', fn_base, flags=re.IGNORECASE)
+            fname = slugify(fn_base)
+            arcname = f"{prefix}{fname}{suffix}.pdf"
+            folder = slugify(extract_template(raw_title)) if group_by=="Template" else ""
             rows.append({
                 "Source PDF": uploads[idx].name,
                 "Folder":     folder,
-                "Form Name":  raw_name,
+                "Form Name":  raw_title,
                 "Pages":      f"{start}-{end}",
                 "Filename":   arcname
             })
