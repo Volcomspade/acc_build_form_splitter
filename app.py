@@ -46,63 +46,74 @@ def slugify(name):
     return re.sub(r'_+', '_', s).strip('_')
 
 def build_patterns(raw):
+    """
+    Turn comma-separated wildcards/regex into patterns:
+      * → .*    (zero-or-more)
+      ? → .     (single char)
+    and escape everything else.
+    """
     pats = []
     for tok in [t.strip() for t in raw.split(',') if t.strip()]:
         esc = re.escape(tok)
-        esc = esc.replace(r'\*', '.*?')     # non-greedy wildcard
+        esc = esc.replace(r'\*', '.*').replace(r'\?', '.')
         pats.append(esc)
     return pats
 
 def extract_meta(doc):
-    # look for the "References and Attachments" section to grab Category & Location
-    cat = "Unknown"
-    loc = "Unknown"
-    for i in range(min(doc.page_count, 5)):
-        txt = doc.load_page(i).get_text().splitlines()
-        for line in txt:
+    """
+    Scan every page for lines starting 'Category' or 'Location',
+    split on the FIRST colon only, ignore lines without one.
+    """
+    cat, loc = "Unknown", "Unknown"
+    for i in range(doc.page_count):
+        for line in doc.load_page(i).get_text().splitlines():
             if line.startswith("Category"):
-                cat = line.split(":",1)[1].strip()
-            if line.startswith("Location"):
-                loc = line.split(":",1)[1].strip()
-        if cat!="Unknown" and loc!="Unknown":
+                parts = line.split(":", 1)
+                if len(parts) > 1:
+                    cat = parts[1].strip()
+            elif line.startswith("Location"):
+                parts = line.split(":", 1)
+                if len(parts) > 1:
+                    loc = parts[1].strip()
+        if cat != "Unknown" and loc != "Unknown":
             break
     return loc, cat
 
 def create_zip(pdf_bytes, patterns, prefix, suffix, remove_id, group_by):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total = doc.page_count
-    toc = detect_toc_pages(doc)
+    toc   = detect_toc_pages(doc)
     entries = parse_toc(doc, toc)
-    splits = split_ranges(entries, total)
+    splits  = split_ranges(entries, total)
     loc, cat = extract_meta(doc)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w') as zf:
         for title, start, end in splits:
             raw_title = title
-            fn = raw_title
-            if remove_id:
-                fn = re.sub(r'^#\s*\d+:\s*', '', fn)
+            # only strip '#1234:' from filename
+            fn = re.sub(r'^#\s*\d+:\s*', '', raw_title) if remove_id else raw_title
             for rx in patterns:
                 fn = re.sub(rx, '', fn, flags=re.IGNORECASE)
             base = slugify(fn)
             filename = f"{prefix}{base}{suffix}.pdf"
 
-            folder = ""
+            # decide folder path
             if group_by == "Template":
-                # use the template from title (after second colon)
-                parts = raw_title.split(":",2)
-                tpl = parts[2].strip() if len(parts)==3 else raw_title
+                parts = raw_title.split(":", 2)
+                tpl = parts[2].strip() if len(parts) == 3 else raw_title
                 folder = slugify(tpl)
             elif group_by == "Location/Category":
                 folder = f"{slugify(loc)}/{slugify(cat)}"
+            else:
+                folder = ""
 
-            arc = filename if not folder else f"{folder}/{filename}"
+            arcname = filename if not folder else f"{folder}/{filename}"
 
             # extract pages
             part = fitz.open()
             part.insert_pdf(doc, from_page=start-1, to_page=end-1)
-            zf.writestr(arc, part.write())
+            zf.writestr(arcname, part.write())
 
     buf.seek(0)
     return buf
@@ -121,6 +132,7 @@ group_by         = st.selectbox("Group files in ZIP by:", ["Location/Category","
 patterns = build_patterns(remove_input)
 
 if uploads:
+    # initial read timing
     t0 = time.time()
     all_bytes = [f.read() for f in uploads]
     read_sec = time.time() - t0
@@ -137,7 +149,7 @@ if uploads:
 
     st.download_button("Download all splits", master, "acc_build_forms.zip", "application/zip")
 
-    # summary
+    # summary metrics
     st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Source PDFs", len(uploads))
@@ -150,7 +162,7 @@ if uploads:
     c3.metric("Total forms", total_forms)
     c4.metric("Initial read", f"{int(read_sec//60):02}:{int(read_sec%60):02}")
 
-    # preview
+    # live preview
     st.subheader("Filename & Page-Range Preview")
     rows = []
     for idx, b in enumerate(all_bytes):
@@ -160,23 +172,23 @@ if uploads:
         ent   = parse_toc(doc, toc)
         spl   = split_ranges(ent, total)
         loc, cat = extract_meta(doc)
+
         for title, start, end in spl:
             raw_title = title
-            fn = raw_title
-            if remove_id_prefix:
-                fn = re.sub(r'^#\s*\d+:\s*', '', fn)
+            fn = re.sub(r'^#\s*\d+:\s*', '', raw_title) if remove_id_prefix else raw_title
             for rx in patterns:
                 fn = re.sub(rx, '', fn, flags=re.IGNORECASE)
             base = slugify(fn)
             fname = f"{prefix}{base}{suffix}.pdf"
 
-            folder = ""
             if group_by=="Template":
                 parts = raw_title.split(":",2)
                 tpl = parts[2].strip() if len(parts)==3 else raw_title
                 folder = slugify(tpl)
             elif group_by=="Location/Category":
                 folder = f"{slugify(loc)}/{slugify(cat)}"
+            else:
+                folder = ""
 
             rows.append({
                 "Source PDF": uploads[idx].name,
