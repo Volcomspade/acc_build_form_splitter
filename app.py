@@ -16,38 +16,42 @@ st.set_page_config(
 # ─── METADATA EXTRACTION ────────────────────────────────────────────────────────
 def extract_meta(doc: fitz.Document):
     """
+    Walk through pages in order until we find:
+      - Template    (first "Template" line)
+      - Category    (first "Category" line)
+      - Location    (first "Location" line)
     Returns (template, category, location).
-    - template: from page 0’s “Template” line (with or without colon)
-    - category, location: from the “References & Attachments” section (pages 1+)
     """
-    # compile once
-    template_rx = re.compile(r"^Template\s*[:\-]?\s*(.+)", re.IGNORECASE)
-    cat_rx      = re.compile(r"^Category\s*[:\-]?\s*(.+)", re.IGNORECASE)
-    loc_rx      = re.compile(r"^Location\s*[:\-]?\s*(.+)", re.IGNORECASE)
+    tpl = cat = loc = None
 
-    # ─ Template on page 0 ────────────────────────────────────────
-    template = "Unknown"
-    for line in doc.load_page(0).get_text().splitlines():
-        m = template_rx.match(line.strip())
-        if m:
-            template = m.group(1).strip()
+    # compile our matchers
+    tpl_rx = re.compile(r"^Template\s*[:\-]?\s*(.+)", re.IGNORECASE)
+    cat_rx = re.compile(r"^Category\s*[:\-]?\s*(.+)", re.IGNORECASE)
+    loc_rx = re.compile(r"^Location\s*[:\-]?\s*(.+)", re.IGNORECASE)
+
+    for p in range(doc.page_count):
+        for line in doc.load_page(p).get_text().splitlines():
+            txt = line.strip()
+            if tpl is None:
+                m = tpl_rx.match(txt)
+                if m:
+                    tpl = m.group(1).strip()
+                    continue
+            if cat is None:
+                m = cat_rx.match(txt)
+                if m:
+                    cat = m.group(1).strip()
+                    continue
+            if loc is None:
+                m = loc_rx.match(txt)
+                if m:
+                    loc = m.group(1).strip()
+                    continue
+        # break early if all found
+        if tpl and cat and loc:
             break
 
-    # ─ Category & Location on pages 1+ ───────────────────────────
-    category = location = "Unknown"
-    for i in range(1, doc.page_count):
-        for line in doc.load_page(i).get_text().splitlines():
-            text = line.strip()
-            m1 = cat_rx.match(text)
-            if m1:
-                category = m1.group(1).strip()
-            m2 = loc_rx.match(text)
-            if m2:
-                location = m2.group(1).strip()
-        if category != "Unknown" and location != "Unknown":
-            break
-
-    return template, category, location
+    return tpl or "Unknown", cat or "Unknown", loc or "Unknown"
 
 # ─── TOC PARSING ───────────────────────────────────────────────────────────────
 def detect_toc_pages(doc: fitz.Document):
@@ -62,8 +66,8 @@ def parse_toc(doc: fitz.Document, toc_pages: list[int]):
     toc_rx = re.compile(r"(#\s*\d+:\s*.+?)\.{3,}\s*(\d+)", re.MULTILINE)
     entries = []
     for pg in toc_pages:
-        txt = doc.load_page(pg-1).get_text() or ""
-        for m in toc_rx.finditer(txt):
+        text = doc.load_page(pg-1).get_text() or ""
+        for m in toc_rx.finditer(text):
             entries.append((m.group(1).strip(), int(m.group(2))))
     return entries
 
@@ -83,11 +87,12 @@ def slugify(name: str) -> str:
 def build_patterns(raw: str):
     pats = []
     for tok in [t.strip() for t in raw.split(",") if t.strip()]:
+        # wildcard '*' → '.*?' non-greedy
         esc = re.escape(tok).replace(r"\*", ".*?")
         pats.append(esc)
     return pats
 
-# ─── SINGLE-PDF SPLIT & ZIPPING ────────────────────────────────────────────────
+# ─── SPLIT + ZIP ────────────────────────────────────────────────────────────────
 def create_subzip(
     pdf_bytes: bytes,
     patterns: list[str],
@@ -108,7 +113,7 @@ def create_subzip(
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         for title, start, end in splits:
-            # pick folder
+            # choose folder
             if group_by == "Location/Category":
                 folder = f"{loc}/{cat}/"
             elif group_by == "Template":
@@ -116,7 +121,7 @@ def create_subzip(
             else:
                 folder = ""
 
-            # build filename
+            # build filename (leave `title` intact for display)
             base = title
             if remove_id:
                 base = re.sub(r"^#\s*\d+:\s*", "", base)
@@ -125,7 +130,7 @@ def create_subzip(
             fname = slugify(base)
             out_name = f"{folder}{prefix}{fname}{suffix}.pdf"
 
-            # pull pages
+            # extract pages
             newd = fitz.open()
             for p in range(start-1, end):
                 newd.insert_pdf(doc, from_page=p, to_page=p)
@@ -161,24 +166,24 @@ group_by = st.selectbox(
 if uploads:
     patterns = build_patterns(remove_input)
 
-    t0 = time.perf_counter()
-    all_bytes = [f.read() for f in uploads]
-    docs      = [fitz.open(stream=b, filetype="pdf") for b in all_bytes]
-    total_pages = sum(d.page_count for d in docs)
-    total_forms = sum(len(parse_toc(d, detect_toc_pages(d))) for d in docs)
+    t0      = time.perf_counter()
+    all_b   = [f.read() for f in uploads]
+    docs    = [fitz.open(stream=b, filetype="pdf") for b in all_b]
+    pages   = sum(d.page_count for d in docs)
+    forms   = sum(len(parse_toc(d, detect_toc_pages(d))) for d in docs)
     elapsed = time.perf_counter() - t0
     m, s = divmod(int(elapsed), 60)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Source PDFs", len(uploads))
-    c2.metric("Total pages", total_pages)
-    c3.metric("Total forms", total_forms)
+    c2.metric("Total pages", pages)
+    c3.metric("Total forms", forms)
     c4.metric("Initial read", f"{m:02d}:{s:02d}")
 
-    def get_master_zip():
+    def build_zip():
         mz = io.BytesIO()
         with zipfile.ZipFile(mz, "w") as out_z:
-            for b in all_bytes:
+            for b in all_b:
                 subzip, *_ = create_subzip(
                     b, patterns, prefix, suffix,
                     remove_id_prefix, group_by
@@ -191,7 +196,7 @@ if uploads:
 
     st.download_button(
         "Download all splits",
-        get_master_zip(),
+        build_zip(),
         file_name="acc_build_forms.zip",
         mime="application/zip",
     )
@@ -200,11 +205,11 @@ if uploads:
     rows = []
     for idx, doc in enumerate(docs):
         tpl, cat, loc = extract_meta(doc)
-        splits = split_ranges(
+        spl = split_ranges(
             parse_toc(doc, detect_toc_pages(doc)),
             doc.page_count
         )
-        for title, start, end in splits:
+        for title, start, end in spl:
             if group_by == "Location/Category":
                 folder = f"{loc} / {cat}"
             elif group_by == "Template":
