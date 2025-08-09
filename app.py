@@ -27,7 +27,6 @@ def normalize_text(s: str) -> str:
     s = s.replace(NBSP, " ")
     s = s.replace("–", "-").replace("—", "-")
     s = re.sub(r"[ \t]+", " ", s)
-    # collapse stray spaces around newlines
     s = re.sub(r"\s+\n", "\n", s)
     s = re.sub(r"\n\s+", "\n", s)
     return s
@@ -42,7 +41,6 @@ def slugify(s: str) -> str:
 
 
 def slugify_path_segment(seg: str) -> str:
-    # keep it readable but safe
     seg = seg.strip()
     seg = re.sub(r'[\\/:*?"<>|]', "", seg)
     seg = re.sub(r"\s+", " ", seg).strip()
@@ -52,8 +50,7 @@ def slugify_path_segment(seg: str) -> str:
 def build_patterns(raw: str) -> List[str]:
     """
     Turn comma-separated user tokens into regex patterns.
-    - Escape everything first
-    - Convert '*' to NON-GREEDY '.*?' so it doesn't eat the whole name
+    Use non-greedy '*' so '0*.0*_' doesn't nuke the whole name.
     """
     pats: List[str] = []
     for tok in [t.strip() for t in raw.split(",") if t.strip()]:
@@ -70,9 +67,7 @@ def apply_patterns(s: str, patterns: List[str]) -> str:
 
 
 def split_breadcrumbs(s: str) -> List[str]:
-    # split on '>' or '/' while keeping clean pieces
-    parts = [p.strip() for p in re.split(r"[>/]", s) if p.strip()]
-    return parts
+    return [p.strip() for p in re.split(r"[>/]", s) if p.strip()]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -110,15 +105,40 @@ def split_ranges(entries: List[Tuple[str, int]], total_pages: int) -> List[Tuple
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PER-SPLIT METADATA (Template / Location / Category)
+# PER-SPLIT METADATA
 # ──────────────────────────────────────────────────────────────────────────────
-def extract_template_for_split(doc: fitz.Document, start_page: int) -> str:
+def parse_field_from_lines(lines: List[str], field: str) -> str | None:
     """
-    Look on the first page of the form split only.
     Accept:
-      - 'Template: ...'
-      - A standalone 'Template' header followed by the next non-empty line.
+      - 'Field: value'
+      - 'Field value'
+      - two-line form:
+            Field
+            value
+    Returns None if not found.
     """
+    pat = re.compile(rf"^{field}\b\s*:?\s*(.*)$", flags=re.IGNORECASE)
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        m = pat.match(s)
+        if m:
+            val = m.group(1).strip()
+            if val:
+                return val
+            # take next non-empty line
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j].strip()
+                if nxt:
+                    return nxt
+                j += 1
+            return None
+        i += 1
+    return None
+
+
+def extract_template_for_split(doc: fitz.Document, start_page: int) -> str:
     p = max(0, start_page - 1)
     txt = normalize_text(doc.load_page(p).get_text())
     lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
@@ -129,14 +149,13 @@ def extract_template_for_split(doc: fitz.Document, start_page: int) -> str:
                 val = ln.split(":", 1)[1].strip()
                 if val:
                     return val
-            # header style → next non-empty line
+            # header then next line
             for j in range(i + 1, len(lines)):
                 nxt = lines[j].strip()
                 if nxt:
                     return nxt
             break
 
-    # fallback: first occurrence on the page
     m = re.search(r"\bTemplate\s*[:\-]?\s*(.+)", txt, flags=re.IGNORECASE)
     if m:
         return m.group(1).splitlines()[0].strip()
@@ -146,44 +165,33 @@ def extract_template_for_split(doc: fitz.Document, start_page: int) -> str:
 
 def extract_loc_cat_for_split(doc: fitz.Document, start_page: int, end_page: int) -> Tuple[str, str]:
     """
-    Search within the split for a 'References and Attachments' or 'Assets' page,
-    then read anchored lines that begin with 'Location' and 'Category'.
-    If not found, fall back to any page in the split with those anchors.
+    Robust extraction that supports one-line and two-line layouts.
+    Prefer 'References and Attachments' pages; fall back to any page in the split.
     """
     location = None
     category = None
 
-    # pass 1: prefer pages that look like “References and Attachments”
+    # Pass 1: pages that look like references/assets summary
     for p in range(start_page - 1, end_page):
         txt = normalize_text(doc.load_page(p).get_text())
-        if "References and Attachments" in txt or "Assets (" in txt or "References" in txt and "Attachments" in txt:
-            for ln in txt.splitlines():
-                s = ln.strip()
-                m_loc = re.match(r"^Location\s+(.+)$", s, flags=re.IGNORECASE)
-                if m_loc:
-                    location = m_loc.group(1).strip()
-                m_cat = re.match(r"^Category\s+(.+)$", s, flags=re.IGNORECASE)
-                if m_cat:
-                    category = m_cat.group(1).strip()
+        if "References and Attachments" in txt or "Assets (" in txt or ("References" in txt and "Attachments" in txt):
+            lines = [ln.strip() for ln in txt.splitlines()]
+            if location is None:
+                location = parse_field_from_lines(lines, "Location")
+            if category is None:
+                category = parse_field_from_lines(lines, "Category")
             if location or category:
                 break
 
-    # pass 2: plain anchored scan within split
-    if not location or not category:
+    # Pass 2: any page within split
+    if location is None or category is None:
         for p in range(start_page - 1, end_page):
-            if location and category:
-                break
             txt = normalize_text(doc.load_page(p).get_text())
-            for ln in txt.splitlines():
-                s = ln.strip()
-                if not location:
-                    m_loc = re.match(r"^Location\s+(.+)$", s, flags=re.IGNORECASE)
-                    if m_loc:
-                        location = m_loc.group(1).strip()
-                if not category:
-                    m_cat = re.match(r"^Category\s+(.+)$", s, flags=re.IGNORECASE)
-                    if m_cat:
-                        category = m_cat.group(1).strip()
+            lines = [ln.strip() for ln in txt.splitlines()]
+            if location is None:
+                location = parse_field_from_lines(lines, "Location")
+            if category is None:
+                category = parse_field_from_lines(lines, "Category")
             if location and category:
                 break
 
@@ -231,23 +239,17 @@ def write_zip_for_docs(
                     else:
                         folder = ""
 
-                    # Filename logic (ID removal only affects filename)
+                    # Filename
                     base = title
                     if remove_id_for_filenames:
                         base = re.sub(r"^#\s*\d+:\s*", "", base)
-
-                    # 1) remove patterns on raw
                     base = apply_patterns(base, patterns)
-                    # 2) slugify
                     fname = slugify(base)
-                    # 3) remove patterns again on slug (lets users target underscores etc.)
                     fname = apply_patterns(fname, patterns)
-                    # 4) cleanup
                     fname = re.sub(r"_+", "_", fname).strip("_")
-
                     out_name = f"{folder}{prefix}{fname}{suffix}.pdf"
 
-                    # Assemble split pages
+                    # Write pages
                     part_doc = fitz.open()
                     for p in range(start - 1, end):
                         part_doc.insert_pdf(doc, from_page=p, to_page=p)
@@ -281,20 +283,18 @@ remove_id_prefix = st.checkbox(
 group_by = st.selectbox(
     "Group files in ZIP by",
     ["None", "Location/Category", "Template"],
-    index=1  # default to Location/Category like your earlier runs
+    index=1
 )
 
-with st.expander("ℹ️ Regex & wildcard tips"):
+with st.expander("📘 Regex & wildcard tips"):
     st.markdown(
         """
 - **Exact text**: type it, e.g. `Checklist`
 - **Wildcard `*`** = any run of characters, **non-greedy** here:
   - `03.*_` removes `03.04_`, `03.03_`, etc.
-  - `0*.0*_` removes things like `03.04_`, `02.03_`
-- **Underscore note**: we remove patterns **before and after** slugify, so:
-  - `L2` removes both `"L2 "` and `"L2_"`
-  - `L2_` specifically removes the underscore version in the final filename
-- **Combine** with commas: `03.*_, L2_`
+  - `0*.0*_` removes patterns like `03.04_`, `02.03_`
+- We remove patterns **before and after** slugify, so `L2_` cleanly drops the underscore form.
+- Combine with commas: `03.*_, L2_`
 """
     )
 
@@ -340,9 +340,7 @@ if uploads:
                     }
                 )
 
-            docs_info.append(
-                {"name": f.name, "bytes": b, "splits": split_rows}
-            )
+            docs_info.append({"name": f.name, "bytes": b, "splits": split_rows})
         finally:
             doc.close()
 
@@ -361,18 +359,17 @@ if uploads:
     c3.metric("Total forms", total_forms)
     c4.metric("Preview ready", f"{mins:02d}:{secs:02d}")
 
-    # LIVE PREVIEW TABLE
+    # PREVIEW
     st.subheader("Filename & Page-Range Preview")
     preview_rows = []
     for info in docs_info:
         for sp in info["splits"]:
-            title = sp["title"]                 # display keeps ID
+            title = sp["title"]
             start, end = sp["start"], sp["end"]
             template = sp["template"]
             location = sp["location"]
             category = sp["category"]
 
-            # Where it will go (human string)
             if group_by == "Location/Category":
                 folder_display = " > ".join(split_breadcrumbs(location) + split_breadcrumbs(category))
             elif group_by == "Template":
@@ -380,8 +377,8 @@ if uploads:
             else:
                 folder_display = ""
 
-            # Filename build (ID removal affects filename only)
-            base = sp["title"]
+            # Filename (ID removed only from filename)
+            base = title
             if remove_id_prefix:
                 base = re.sub(r"^#\s*\d+:\s*", "", base)
             base = apply_patterns(base, patterns)
@@ -403,7 +400,6 @@ if uploads:
     df = pd.DataFrame(preview_rows)
     st.dataframe(df, use_container_width=True)
 
-    # DOWNLOAD
     st.divider()
     st.write("When you click download, the ZIP is assembled with the same previewed folder structure.")
     zip_buf = write_zip_for_docs(
