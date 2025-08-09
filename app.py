@@ -21,7 +21,7 @@ st.title("ACC Build TOC Splitter")
 # ──────────────────────────────────────────────────────────────────────────────
 
 def slugify(name: str) -> str:
-    """Make a string safe for filenames."""
+    """Make a string safe for filenames & folders."""
     s = re.sub(r'[\\/:*?"<>|]', "", name)
     s = re.sub(r"\s+", "_", s)
     s = re.sub(r"_+", "_", s)
@@ -30,14 +30,12 @@ def slugify(name: str) -> str:
 
 def build_patterns(raw: str) -> List[str]:
     """
-    Turn comma-separated tokens into regex patterns.
-    - Escape literally (so dots, plus, etc. don't explode)
-    - Then replace '*' with '.*' to create wildcards
+    Comma-separated tokens → regex patterns with '*' as wildcard.
     """
     pats: List[str] = []
     for tok in [t.strip() for t in raw.split(",") if t.strip()]:
         esc = re.escape(tok)
-        esc = esc.replace(r"\*", ".*")
+        esc = esc.replace(r"\*", ".*")  # allow wildcard
         pats.append(esc)
     return pats
 
@@ -54,16 +52,16 @@ def _grab_key_value(text: str, key: str) -> str:
     """
     Return the value for 'key' in two cases:
       1) 'Key: value'
-      2) Table layout:
+      2) Two-line table:
            Key
            value
     """
-    # Case 1: 'Key: value'
+    # Case 1
     m = re.search(rf"(?im)^\s*{re.escape(key)}\s*[:\-]\s*(.+?)\s*$", text)
     if m:
         return m.group(1).strip()
 
-    # Case 2: key on line N, value on the next non-empty line
+    # Case 2
     lines = [ln.strip() for ln in text.splitlines()]
     for i, ln in enumerate(lines):
         if ln.lower() == key.lower():
@@ -73,58 +71,48 @@ def _grab_key_value(text: str, key: str) -> str:
     return ""
 
 
-def extract_meta(doc: fitz.Document) -> Tuple[str, str, str]:
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-split metadata extraction
+# ──────────────────────────────────────────────────────────────────────────────
+
+def extract_meta_for_split(doc: fitz.Document, start0: int, end0: int) -> Tuple[str, str, str]:
     """
-    Robustly extract:
-      - Template (from first page 'Forms' table)
-      - Category and Location (from 'References and Attachments' / Assets)
+    Extract (template, category, location) for a single split.
+    - template: from the split's first page "Forms" table (key 'Template')
+    - category/location: from 'References and Attachments' nearby pages
     """
     template = "Unknown"
     category = "Unknown"
     location = "Unknown"
 
-    # --- Template from page 0
+    # --- Template from the split's first page
     try:
-        t0 = doc.load_page(0).get_text() or ""
-        val = _grab_key_value(t0, "Template")
-        if val:
-            template = val
+        p0_text = doc.load_page(start0).get_text() or ""
+        t = _grab_key_value(p0_text, "Template")
+        if t:
+            template = t
         else:
-            # Fallback: a reasonable exhibit line
-            for ln in t0.splitlines():
+            # fallback: exhibit-ish line on that page
+            for ln in p0_text.splitlines():
                 low = ln.lower()
-                if "exhibit" in low and ("checklist" in low or "inspection" in low):
+                if "exhibit" in low and ("checklist" in low or "inspection" in low or "acc build" in low):
                     template = ln.strip()
                     break
     except Exception:
         pass
 
-    # --- Category & Location near "References and Attachments"
+    # --- Category & Location from the next few pages in this split
+    # Keep it local to the split to avoid bleeding across forms
     try:
-        scored = []
-        for i in range(min(doc.page_count, 30)):
-            tx = (doc.load_page(i).get_text() or "")
-            low = tx.lower()
-            score = 0
-            if "references and attachments" in low:
-                score += 3
-            if "assets" in low:
-                score += 2
-            if "category" in low or "location" in low:
-                score += 1
-            if score:
-                scored.append((score, i))
-        scored.sort(reverse=True)
-        search_pages = [i for _, i in scored] or list(range(min(10, doc.page_count)))
-
-        for i in search_pages:
-            tx = doc.load_page(i).get_text() or ""
+        scan_to = min(end0, start0 + 12)  # look at first ~12 pages of the split
+        for p in range(start0, scan_to + 1):
+            tx = doc.load_page(p).get_text() or ""
             vcat = _grab_key_value(tx, "Category")
             vloc = _grab_key_value(tx, "Location")
 
             if vcat:
                 category = vcat
-            if vloc and "form detail report" not in vloc.lower():
+            if vloc and "form detail report report is split" not in vloc.lower():
                 location = vloc
 
             if category != "Unknown" and location != "Unknown":
@@ -135,22 +123,21 @@ def extract_meta(doc: fitz.Document) -> Tuple[str, str, str]:
     return template, category, location
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# TOC parsing
+# ──────────────────────────────────────────────────────────────────────────────
+
 def detect_toc_pages(doc: fitz.Document) -> List[int]:
-    """Return 1-based page numbers that contain TOC entries ('# 1234:')."""
     entry_rx = re.compile(r"^#\s*\d+:", re.MULTILINE)
     pages = []
     for i in range(doc.page_count):
         text = doc.load_page(i).get_text()
         if entry_rx.search(text or ""):
-            pages.append(i + 1)
+            pages.append(i + 1)  # 1-based for human-like
     return pages
 
 
 def parse_toc(doc: fitz.Document, toc_pages: List[int]) -> List[Tuple[str, int]]:
-    """
-    Return a list of (title, start_page) from TOC pages.
-    TOC lines look like: '# 7893: Form Name ........ 15'
-    """
     toc_rx = re.compile(r"#\s*\d+:\s*(.+?)\.{3,}\s*(\d+)", re.MULTILINE)
     entries: List[Tuple[str, int]] = []
     for pg in toc_pages:
@@ -161,7 +148,6 @@ def parse_toc(doc: fitz.Document, toc_pages: List[int]) -> List[Tuple[str, int]]
 
 
 def split_ranges(entries: List[Tuple[str, int]], total: int) -> List[Tuple[str, int, int]]:
-    """Turn (title, start) into (title, start, end)."""
     out: List[Tuple[str, int, int]] = []
     for i, (title, start) in enumerate(entries):
         end = entries[i + 1][1] - 1 if i + 1 < len(entries) else total
@@ -170,7 +156,7 @@ def split_ranges(entries: List[Tuple[str, int]], total: int) -> List[Tuple[str, 
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Single-PDF → sub-zip
+# Zip creation (per PDF, per split foldering)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def create_subzip(
@@ -180,11 +166,7 @@ def create_subzip(
     suffix: str,
     remove_id: bool,
     group_by: str,
-) -> Tuple[io.BytesIO, str, str, str, List[Tuple[str, int, int]]]:
-    """
-    Split a single PDF (by TOC) and return:
-      subzip_buf, template, category, location, splits
-    """
+) -> io.BytesIO:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total_pages = doc.page_count
 
@@ -192,28 +174,34 @@ def create_subzip(
     entries = parse_toc(doc, toc_pages)
     splits = split_ranges(entries, total_pages)
 
-    tpl, cat, loc = extract_meta(doc)
-
-    # Prepare folder names for zip paths
-    def folderify(s: str) -> str:
-        return slugify(s.replace(">", "/").replace("\\", "/"))
-
-    folder_tpl = folderify(tpl) if tpl != "Unknown" else "Unknown"
-    folder_loc = folderify(loc) if loc != "Unknown" else "Unknown"
-    folder_cat = folderify(cat) if cat != "Unknown" else "Unknown"
+    def folderify_for_path(s: str) -> str:
+        # turn 'A > B > C' into subfolders A/B/C and slugify each segment
+        parts = [slugify(p.strip()) for p in s.split(">")]
+        parts = [p for p in parts if p]
+        return "/".join(parts)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         for title, start, end in splits:
-            # folder path for this split
+            # metadata for *this split*
+            tpl, cat, loc = extract_meta_for_split(doc, start - 1, end - 1)
+
+            # decide folder
             if group_by == "Location/Category":
-                folder = f"{folder_loc}/{folder_cat}/" if folder_loc or folder_cat else ""
+                combined = ""
+                if loc != "Unknown":
+                    combined = loc
+                if cat != "Unknown":
+                    combined = f"{combined} > {cat}" if combined else cat
+                folder = folderify_for_path(combined)
+                folder = f"{folder}/" if folder else ""
             elif group_by == "Template":
-                folder = f"{folder_tpl}/" if folder_tpl else ""
+                folder = folderify_for_path(tpl)
+                folder = f"{folder}/" if folder else ""
             else:
                 folder = ""
 
-            # filename base (ID stripped only for the filename)
+            # filename sanitization (strip ID only in filename)
             base = title
             if remove_id:
                 base = re.sub(r"^#\s*\d+:\s*", "", base)
@@ -222,17 +210,15 @@ def create_subzip(
             fname = slugify(base)
             out_name = f"{folder}{prefix}{fname}{suffix}.pdf"
 
-            # write the page range into a new PDF in the zip
+            # write pages
             part_doc = fitz.open()
             for p in range(start - 1, end):
                 part_doc.insert_pdf(doc, from_page=p, to_page=p)
-            part_bytes = part_doc.tobytes()
+            zf.writestr(out_name, part_doc.tobytes())
             part_doc.close()
 
-            zf.writestr(out_name, part_bytes)
-
     buf.seek(0)
-    return buf, tpl, cat, loc, splits
+    return buf
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -260,25 +246,22 @@ group_by = st.selectbox(
 with st.expander("📘 Pattern tips"):
     st.markdown(
         """
-- **Exact text**: just type it, e.g. `Checklist`  
-- **Wildcard `*`**: matches any run of characters, e.g. `03.*_` removes `03.04_`, `03.03_`, etc.  
-- **Combine with commas**: e.g. `03.*_, L2_`  
-- Patterns apply **only to the saved filenames**, not to the ‘Form Name’ column.
+- **Exact text**: just type it, e.g. `Checklist`
+- **Wildcard `*`**: matches any run of characters, e.g. `03.*_` removes `03.04_`, `03.03_`, etc.
+- **Combine with commas**: `03.*_, L2_`
+- Patterns apply **only to the saved filenames**, not to the “Form Name” column.
         """
     )
 
 if uploads:
     patterns = build_patterns(remove_input)
 
-    # Initial read (load into memory & quick stats)
+    # Read in memory & quick stats
     t0 = time.perf_counter()
     all_bytes = [f.read() for f in uploads]
     docs = [fitz.open(stream=b, filetype="pdf") for b in all_bytes]
     total_pages = sum(d.page_count for d in docs)
-    total_forms = sum(
-        len(parse_toc(d, detect_toc_pages(d)))
-        for d in docs
-    )
+    total_forms = sum(len(parse_toc(d, detect_toc_pages(d))) for d in docs)
     elapsed = int(time.perf_counter() - t0)
     mins, secs = divmod(elapsed, 60)
 
@@ -288,21 +271,19 @@ if uploads:
     c3.metric("Total forms", total_forms)
     c4.metric("Initial read", f"{mins:02d}:{secs:02d}")
 
-    # Build master ZIP
-    def get_zip():
+    # Build ZIP
+    def make_master_zip():
         mz = io.BytesIO()
         with zipfile.ZipFile(mz, "w") as master:
             for b in all_bytes:
-                subzip, *_ = create_subzip(
-                    b, patterns, prefix, suffix, remove_id_prefix, group_by
-                )
-                with zipfile.ZipFile(subzip) as sz:
+                sub = create_subzip(b, patterns, prefix, suffix, remove_id_prefix, group_by)
+                with zipfile.ZipFile(sub) as sz:
                     for info in sz.infolist():
                         master.writestr(info.filename, sz.read(info.filename))
         mz.seek(0)
         return mz
 
-    zip_buf = get_zip()
+    zip_buf = make_master_zip()
     st.download_button(
         "Download all splits",
         zip_buf,
@@ -310,31 +291,34 @@ if uploads:
         mime="application/zip",
     )
 
-    # Live preview
+    # Live preview (metadata per split)
     preview_rows = []
     for idx, (b, d) in enumerate(zip(all_bytes, docs)):
-        tpl, cat, loc = extract_meta(d)
-        splits = split_ranges(
-            parse_toc(d, detect_toc_pages(d)), d.page_count
-        )
-
-        # Pretty folder names for the preview table
-        folder_preview = ""
-        if group_by == "Location/Category":
-            folder_preview = (
-                f"{loc} / {cat}" if (loc != 'Unknown' or cat != 'Unknown') else ""
-            )
-        elif group_by == "Template":
-            folder_preview = tpl if tpl != "Unknown" else ""
+        entries = parse_toc(d, detect_toc_pages(d))
+        splits = split_ranges(entries, d.page_count)
 
         for title, start, end in splits:
+            tpl, cat, loc = extract_meta_for_split(d, start - 1, end - 1)
+
+            # display folder preview with > separators for readability
+            if group_by == "Location/Category":
+                pieces = []
+                if loc != "Unknown":
+                    pieces.append(loc)
+                if cat != "Unknown":
+                    pieces.append(cat)
+                folder_preview = " > ".join(pieces) if pieces else ""
+            elif group_by == "Template":
+                folder_preview = tpl if tpl != "Unknown" else ""
+            else:
+                folder_preview = ""
+
             base = title
             if remove_id_prefix:
                 base = re.sub(r"^#\s*\d+:\s*", "", base)
             for rx in patterns:
                 base = re.sub(rx, "", base, flags=re.IGNORECASE)
-            fname = slugify(base)
-            fn = f"{prefix}{fname}{suffix}.pdf"
+            fn = f"{prefix}{slugify(base)}{suffix}.pdf"
 
             preview_rows.append({
                 "Source PDF": uploads[idx].name,
@@ -344,6 +328,5 @@ if uploads:
                 "Filename": fn,
             })
 
-    df = pd.DataFrame(preview_rows)
     st.subheader("Filename & Page-Range Preview")
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
